@@ -253,7 +253,7 @@ private struct Paper: View {
 }
 
 /// 下沿锯齿：像从纸卷上撕下来的
-private struct TornBottom: Shape {
+private nonisolated struct TornBottom: Shape {
     func path(in r: CGRect) -> Path {
         var p = Path()
         p.move(to: .zero)
