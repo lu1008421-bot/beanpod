@@ -1205,17 +1205,37 @@ final class BeanStore {
         }
     }
 
+    private static let logByteLimit = 5 * 1024 * 1024
     @ObservationIgnored private let logFile: FileHandle? = {
-        let url = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/BeanPod.log")
-        if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
-        let handle = try? FileHandle(forWritingTo: url)
-        _ = try? handle?.seekToEnd()
-        return handle
+        let fm = FileManager.default
+        let directory = fm.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs")
+        let url = directory.appendingPathComponent(BeanStore.demo ? "BeanPod-Demo.log" : "BeanPod.log")
+        do {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !fm.fileExists(atPath: url.path) { try Data().write(to: url, options: .withoutOverwriting) }
+            return try FileHandle(forWritingTo: url)
+        } catch {
+            NSLog("豆仓无法打开日志文件：%@", error.localizedDescription)
+            return nil
+        }
     }()
 
     func addLog(_ line: String) {
         let stamped = "\(Date.now.formatted(date: .omitted, time: .standard))  \(line)"
-        logFile?.write(Data((stamped + "\n").utf8))
+        if let logFile {
+            var entry = Data((stamped + "\n").utf8)
+            if entry.count > Self.logByteLimit { entry = Data("豆仓日志单行超过大小上限\n".utf8) }
+            do {
+                let size = try logFile.seekToEnd()
+                if size > UInt64(Self.logByteLimit - entry.count) {
+                    try logFile.truncate(atOffset: 0)
+                    try logFile.seek(toOffset: 0)
+                }
+                try logFile.write(contentsOf: entry)
+            } catch {
+                NSLog("豆仓无法写入日志文件：%@", error.localizedDescription)
+            }
+        }
         log.append(stamped)
         if log.count > 400 { log.removeFirst(log.count - 400) }
     }
