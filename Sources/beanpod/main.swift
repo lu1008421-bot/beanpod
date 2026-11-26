@@ -1,7 +1,7 @@
 // beanpod：让别的工具读写豆仓。
 //
 //   beanpod mcp                       作为 MCP 服务运行（stdio），给 Claude、OpenClaw、Grok 等 agent 用
-//   beanpod serve [--port 8791]       作为 MCP 服务运行（HTTP），给只认网址的工具用，只监听本机
+//   BEANPOD_MCP_TOKEN=... beanpod serve [--port 8791]  作为 MCP 服务运行（HTTP），仅监听 127.0.0.1，强制令牌鉴权
 //   beanpod search 关键词 [选项]       搜索录音
 //   beanpod show <id> [--transcript]  看一条录音的纪要（和文字稿）
 //   beanpod todos [--all]             待办
@@ -11,6 +11,8 @@
 //
 // 读是直接读豆仓的记录文件，只读不改。写是把文件放进豆仓的收件箱，由豆仓 App 自己入库。
 
+import BeanKit
+import Darwin
 import Foundation
 import Network
 
@@ -298,64 +300,109 @@ func runMCP() {
 
 // MARK: - MCP（HTTP）
 
-/// 同一套工具，换成 HTTP 入口：POST /mcp，一个请求一个 JSON 回答。只监听 127.0.0.1。
-func runHTTP(port: UInt16) {
+var parentWatchTimer: DispatchSourceTimer?
+
+func sendHTTPAndClose(_ conn: NWConnection, _ data: Data) {
+    conn.send(content: data, completion: .contentProcessed { _ in conn.cancel() })
+}
+
+/// 同一套工具，换成 HTTP 入口：POST /mcp，一个请求一个 JSON 回答。只监听 127.0.0.1，且强制令牌鉴权。
+func runHTTP(port: UInt16, parentPID: Int32?) {
+    let token = ProcessInfo.processInfo.environment["BEANPOD_MCP_TOKEN"] ?? ""
+    guard MCPHTTPPolicy.isValidTokenFormat(token) else {
+        let msg = "启动 HTTP MCP 失败：请通过环境变量 BEANPOD_MCP_TOKEN 提供至少 \(MCPHTTPPolicy.minimumTokenLength) 位非空白 ASCII 令牌。\n"
+        FileHandle.standardError.write(Data(msg.utf8))
+        exit(1)
+    }
     let params = NWParameters.tcp
-    params.acceptLocalOnly = true          // 只接受本机发来的连接
     params.allowLocalEndpointReuse = true
-    guard let nwPort = NWEndpoint.Port(rawValue: port), let listener = try? NWListener(using: params, on: nwPort) else {
+    guard let nwPort = NWEndpoint.Port(rawValue: port) else {
         print("端口 \(port) 用不了"); exit(1)
+    }
+    params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: nwPort)
+    guard let listener = try? NWListener(using: params) else {
+        print("端口 \(port) 用不了"); exit(1)
+    }
+    if let ppid = parentPID, ppid > 1 {
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler {
+            if kill(ppid, 0) != 0 && errno == ESRCH { exit(0) }
+        }
+        timer.resume()
+        parentWatchTimer = timer
     }
     listener.newConnectionHandler = { conn in
         conn.start(queue: .global())
-        receive(conn, Data())
+        receive(conn, Data(), port: port, expectedToken: token)
     }
     listener.stateUpdateHandler = { state in
         if case .failed(let e) = state { print("监听失败：\(e)"); exit(1) }
         if case .waiting(let e) = state { print("端口 \(port) 暂时用不了：\(e)"); exit(1) }
-        if case .ready = state { print("豆仓 MCP 已在 http://127.0.0.1:\(port)/mcp 就绪") ; fflush(stdout) }
+        if case .ready = state { print("豆仓 MCP 已在 http://127.0.0.1:\(port)/mcp 就绪（已启用本机令牌鉴权）"); fflush(stdout) }
     }
     listener.start(queue: .global())
     dispatchMain()
 }
 
-func receive(_ conn: NWConnection, _ buffer: Data) {
+func receive(_ conn: NWConnection, _ buffer: Data, port: UInt16, expectedToken: String) {
     conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, done, error in
         var buf = buffer
         if let data { buf.append(data) }
-        // 等头部收完，再按 Content-Length 等正文收完
+        // 等头部收完，先做 Host / Origin / 方法 / 令牌校验，再按 Content-Length 收正文
         if let headEnd = buf.range(of: Data("\r\n\r\n".utf8)) {
-            let head = String(decoding: buf[..<headEnd.lowerBound], as: UTF8.self)
-            let length = head.split(separator: "\r\n").first { $0.lowercased().hasPrefix("content-length:") }
-                .flatMap { Int($0.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) } ?? 0
-            let body = buf[headEnd.upperBound...]
-            if body.count >= length {
-                respond(conn, requestLine: String(head.split(separator: "\r\n").first ?? ""), body: Data(body.prefix(length)))
+            let headBytes = buf[..<headEnd.lowerBound]
+            guard headBytes.count <= MCPHTTPPolicy.maxHeaderBytes else {
+                sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: "431 Request Header Fields Too Large", body: MCPHTTPPolicy.errorBody("headers too large")))
                 return
             }
+            let head = String(decoding: headBytes, as: UTF8.self)
+            switch MCPHTTPPolicy.parseRequestHead(head) {
+            case .error(let status, let message):
+                sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: status, body: MCPHTTPPolicy.errorBody(message)))
+                return
+            case .ok(let req):
+                switch MCPHTTPPolicy.validate(req, port: port, expectedToken: expectedToken) {
+                case .reject(let status, let message, let extraHeaders):
+                    sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: status, body: MCPHTTPPolicy.errorBody(message), extraHeaders: extraHeaders))
+                    return
+                case .health:
+                    sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: "200 OK", body: Data("{\"ok\":true}".utf8)))
+                    return
+                case .mcp:
+                    let body = buf[headEnd.upperBound...]
+                    if body.count >= req.contentLength {
+                        handleMCPBody(conn, Data(body.prefix(req.contentLength)))
+                        return
+                    }
+                }
+            }
+        } else if buf.count > MCPHTTPPolicy.maxHeaderBytes {
+            sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: "431 Request Header Fields Too Large", body: MCPHTTPPolicy.errorBody("headers too large")))
+            return
         }
-        if done || error != nil || buf.count > 8 << 20 { conn.cancel(); return }
-        receive(conn, buf)
+        if done || error != nil || buf.count > MCPHTTPPolicy.maxHeaderBytes + MCPHTTPPolicy.maxBodyBytes {
+            conn.cancel()
+            return
+        }
+        receive(conn, buf, port: port, expectedToken: expectedToken)
     }
 }
 
-func respond(_ conn: NWConnection, requestLine: String, body: Data) {
-    func reply(_ status: String, _ payload: Data, type: String = "application/json") {
-        var out = Data("HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(payload.count)\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nConnection: close\r\n\r\n".utf8)
-        out.append(payload)
-        conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
+func handleMCPBody(_ conn: NWConnection, _ body: Data) {
+    guard let json = try? JSONSerialization.jsonObject(with: body) else {
+        sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: "400 Bad Request", body: MCPHTTPPolicy.errorBody("bad json")))
+        return
     }
-    let parts = requestLine.split(separator: " ")
-    let method = parts.first.map(String.init) ?? "", path = parts.count > 1 ? String(parts[1]) : "/"
-    if method == "OPTIONS" { reply("204 No Content", Data()); return }
-    if method == "GET", path == "/health" { reply("200 OK", Data("{\"ok\":true}".utf8)); return }
-    guard method == "POST" else { reply("405 Method Not Allowed", Data("{\"error\":\"use POST\"}".utf8)); return }
-    guard let json = try? JSONSerialization.jsonObject(with: body) else { reply("400 Bad Request", Data("{\"error\":\"bad json\"}".utf8)); return }
     let messages = (json as? [[String: Any]]) ?? (json as? [String: Any]).map { [$0] } ?? []
     let replies = messages.compactMap(handle)
-    if replies.isEmpty { reply("202 Accepted", Data()); return }
+    if replies.isEmpty {
+        sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: "202 Accepted", body: Data()))
+        return
+    }
     let payload: Any = (json is [Any]) ? replies : replies[0]
-    reply("200 OK", (try? JSONSerialization.data(withJSONObject: payload)) ?? Data())
+    let encoded = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
+    sendHTTPAndClose(conn, MCPHTTPPolicy.formatResponse(status: "200 OK", body: encoded))
 }
 
 // MARK: - 命令行
@@ -370,7 +417,10 @@ func option(_ name: String) -> String? {
 let command = args.isEmpty ? "help" : args.removeFirst()
 switch command {
 case "mcp": runMCP()
-case "serve": runHTTP(port: option("--port").flatMap(UInt16.init) ?? 8791)
+case "serve":
+    let port = option("--port").flatMap(UInt16.init) ?? 8791
+    let parentPID = option("--parent-pid").flatMap(Int32.init)
+    runHTTP(port: port, parentPID: parentPID)
 case "search":
     var q = Query()
     q.scene = option("--scene"); q.person = option("--person"); q.tag = option("--tag")
@@ -392,14 +442,14 @@ default:
     print("""
     beanpod：让别的工具读写豆仓
 
-      beanpod mcp                          作为 MCP 服务运行，给 Claude、OpenClaw、Grok 等 agent 用
-      beanpod serve [--port 8791]          同上，但走 HTTP，地址是 http://127.0.0.1:8791/mcp
+      beanpod mcp                                       作为 MCP 服务运行，给 Claude、OpenClaw 等 agent 用
+      BEANPOD_MCP_TOKEN=<令牌> beanpod serve [--port 8791]  同上，但走 HTTP，仅监听 http://127.0.0.1:8791/mcp
       beanpod search [关键词] [--from 日期] [--to 日期] [--scene 场景] [--person 人物] [--tag 话题] [--limit N]
-      beanpod show <id> [--transcript]     一条录音的纪要
-      beanpod todos [--all]                待办
-      beanpod topics                       场景、话题、人物一览
-      beanpod add-note 标题 < 文本          把文字存进豆仓
-      beanpod add-audio <文件>              把音频交给豆仓转写整理
+      beanpod show <id> [--transcript]                  一条录音的纪要
+      beanpod todos [--all]                             待办
+      beanpod topics                                    场景、话题、人物一览
+      beanpod add-note 标题 < 文本                       把文字存进豆仓
+      beanpod add-audio <文件>                           把音频交给豆仓转写整理
 
     日期可以写 2026-11-12、today、yesterday、7d。
     """)

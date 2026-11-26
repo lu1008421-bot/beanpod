@@ -117,6 +117,8 @@ final class AppSettings {
 
     var llamaServerPath: String { didSet { save("llamaServerPath", llamaServerPath) } }
     var exportFolder: String { didSet { save("exportFolder", exportFolder) } }
+    /// 本机 HTTP MCP 网址入口默认关闭，仅给只认网址的工具按需开启。
+    var httpMCPEnabled: Bool { didSet { save("httpMCPEnabled", httpMCPEnabled) } }
 
     var llmConfigured: Bool { !llmBaseURL.isEmpty && !llmModel.isEmpty }
     var llmIsLocal: Bool { llmBaseURL.contains("127.0.0.1") || llmBaseURL.contains("localhost") }
@@ -167,6 +169,7 @@ final class AppSettings {
         asrKey = Keychain.migrate("asrKey")
         llamaServerPath = d.string(forKey: "llamaServerPath") ?? ""
         exportFolder = d.string(forKey: "exportFolder") ?? ""
+        httpMCPEnabled = d.object(forKey: "httpMCPEnabled") as? Bool ?? false
     }
 
     private func save(_ key: String, _ value: Any) { UserDefaults.standard.set(value, forKey: key) }
