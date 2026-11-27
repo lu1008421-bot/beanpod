@@ -204,7 +204,7 @@ xcodebuild -project BeanPod.xcodeproj -scheme BeanPod -configuration Debug -dest
 启动测试 App 时严禁直接读写默认正式库，使用 `-demo` 或新建的隔离数据目录：
 
 ```sh
-open -n build/friends-qa/Build/Products/Debug/BeanPod.app --args -data-dir /tmp/beanpod-people-qa
+open -n build/friends-qa/Build/Products/Debug/BeanPod.app --args -demo -data-dir /tmp/beanpod-people-qa
 ```
 
 因修改涉及 `Shared/`，同步验证 `BeanPodMobile`（iOS Simulator 27.2 SDK 已在本机核实存在）：

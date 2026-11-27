@@ -291,6 +291,8 @@ final class BeanStore {
 
     /// 隔离数据根目录：启动参数 `-data-dir <绝对路径>`（优先）或环境变量 `BEANPOD_DATA_DIR`。
     /// 测试与自动化验收完全写入该目录（Recordings/、People/ 等都在其下），不碰正式库。优先级高于 `-demo`。
+    /// QA 启动请用 `--args -demo -data-dir <独立测试目录>`：`-demo` 关蓝牙/MCP/飞书，`-data-dir` 指到临时库，二者缺一不可
+    /// （只传 `-data-dir` 会照常连录音豆、列出设备录音；只传 `-demo` 会读固定的示例库）。
     nonisolated static let dataDir: URL? = {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "-data-dir"), i + 1 < args.count, !args[i + 1].isEmpty {

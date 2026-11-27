@@ -222,6 +222,39 @@ final class PeoplePipelineTests: XCTestCase {
         XCTAssertEqual(mine.map(\.startMs), [0, 9000])
     }
 
+    /// 单句改归属后：旧人物的这条发言与代表原声即时剔除，另一句仍归原人，不能还播得出来。
+    func testCarveManualRangeDropsOldAttributionAndSample() throws {
+        let db = try openDB()
+        let rec: UInt32 = 9002
+        let old = try db.createPerson(displayName: "", status: .pending)
+        try db.replaceAutoUtterances(recordingID: rec, [
+            utterance(rec, 2000, 10000, speaker: 0, person: old.id),   // 0:02–0:10 要改归别人
+            utterance(rec, 13000, 16000, speaker: 0, person: old.id),  // 0:13 仍归原人
+        ])
+        let clip = VoiceSample(id: UUID(), personID: old.id, sourceKind: .recordingSpan, recordingID: rec,
+                               startMs: 2000, endMs: 10000, managedFile: nil, channel: .nearField,
+                               confirmed: false, modelVersion: "cam++", contentHash: "r9002-0-2000")
+        try db.addSample(clip, embedding: unit(0))
+
+        try db.carveManualRange(recordingID: rec, oldLocalSpeaker: 0, oldPersonID: old.id, startMs: 2000, endMs: 10000)
+
+        let mine = try db.listUtterancesForPerson(personID: old.id)
+        XCTAssertEqual(mine.map(\.startMs), [13000], "只剩 0:13 那句")
+        XCTAssertTrue(try db.listSamples(personID: old.id).isEmpty, "0:02–0:10 的代表原声要删掉，不能还点得动")
+    }
+
+    /// 改掉的只是 run 里的一句：run 的前后半段还归原人，一分为二裁掉中间那句，不误删别人。
+    func testCarveManualRangeSplitsPartialOverlap() throws {
+        let db = try openDB()
+        let rec: UInt32 = 9003
+        let old = try db.createPerson(displayName: "", status: .pending)
+        try db.replaceAutoUtterances(recordingID: rec, [utterance(rec, 0, 20000, speaker: 0, person: old.id)])
+        try db.carveManualRange(recordingID: rec, oldLocalSpeaker: 0, oldPersonID: old.id, startMs: 2000, endMs: 10000)
+        let mine = try db.listUtterancesForPerson(personID: old.id)
+        XCTAssertEqual(mine.map(\.startMs), [0, 10000])
+        XCTAssertEqual(mine.map(\.endMs), [2000, 20000])
+    }
+
     /// 代表原声是几句各自连续的话（最长的至多 3 段），不是从第一次开口到最后一次的整条。
     func testRepresentativeClipsAreSeparateSegments() {
         let v = [Float(1)]

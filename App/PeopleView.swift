@@ -43,7 +43,16 @@ struct PeopleView: View {
         }
         .navigationTitle("人物")
         .navigationSubtitle(store.confirmedPeople.isEmpty ? "" : "\(store.confirmedPeople.count) 位联系人")
-        .onAppear { if let p = nav.selectedPersonID ?? nav.returnPersonID { selected = p } }
+        .onAppear {
+            if let p = nav.selectedPersonID ?? nav.returnPersonID,
+               let person = store.people.first(where: { $0.id == p }), store.personVisible(p) {
+                selected = p
+                if person.status == .pending { showPending = true }
+            } else if selected == nil, let first = (confirmed.first ?? pending.first) {
+                selected = first.id
+                if first.status == .pending { showPending = true }
+            }
+        }
         .onChange(of: selected) { _, v in nav.selectedPersonID = v }
         .sheet(item: $naming) { person in
             nameSheet(person)
@@ -219,10 +228,10 @@ struct PeopleView: View {
     // MARK: 右栏
 
     @ViewBuilder private var detailPane: some View {
-        if let selected, let person = store.people.first(where: { $0.id == selected }) {
+        if let selected, store.personVisible(selected), let person = store.people.first(where: { $0.id == selected }) {
             personDetail(person)
         } else if let first = (confirmed.first ?? pending.first) {
-            personDetail(first).onAppear { selected = first.id }
+            personDetail(first)
         } else {
             VStack(spacing: 14) {
                 Image(systemName: "person.crop.circle.badge.questionmark").font(.system(size: 40)).foregroundStyle(Theme.warm300)

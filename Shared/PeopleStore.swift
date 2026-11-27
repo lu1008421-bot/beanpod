@@ -153,9 +153,27 @@ extension BeanStore {
         people.filter { $0.status == .confirmed && !$0.isMe }.sorted { ($0.lastMetAt ?? .distantPast) > ($1.lastMetAt ?? .distantPast) }
     }
 
-    /// 待认识声音（未命名、未忽略）。
+    /// 待认识声音（未命名、未忽略，且仍有一处可见来源：未排除录音的发言/代表原声，或导入的样本）。
     var pendingPeople: [Person] {
-        people.filter { $0.status == .pending }.sorted { ($0.lastMetAt ?? .distantPast) > ($1.lastMetAt ?? .distantPast) }
+        people.filter { $0.status == .pending && hasVisibleSource($0.id) }
+            .sorted { ($0.lastMetAt ?? .distantPast) > ($1.lastMetAt ?? .distantPast) }
+    }
+
+    /// 人物页还看不看得见这张卡：待认识卡在其唯一来源被排除后就不再可见，已确认/我的声音照常。
+    func personVisible(_ pid: UUID) -> Bool {
+        guard let p = people.first(where: { $0.id == pid }) else { return false }
+        if p.status == .pending { return hasVisibleSource(pid) }
+        return p.status != .ignored
+    }
+
+    /// 某张待认识卡是否还有未排除录音上的数据（发言或代表原声）或导入样本。全被排除出「人物」就不再提示。
+    private func hasVisibleSource(_ pid: UUID) -> Bool {
+        guard let db = peopleDB else { return true }
+        let live = Set(recordings.filter { !$0.peopleExcluded }.map(\.id))
+        let utts = (try? db.listUtterancesForPerson(personID: pid)) ?? []
+        if utts.contains(where: { live.contains($0.recordingID) }) { return true }
+        let samples = (try? db.listSamples(personID: pid)) ?? []
+        return samples.contains { $0.recordingID == nil || live.contains($0.recordingID!) }
     }
 
     /// 待认识声音的数量（首页折叠提示条用）。
@@ -224,7 +242,8 @@ extension BeanStore {
     /// 「疑似某人」的匹配建议：分人时像某位已有人物、但分数不够自动署名，留给用户定。
     func suggestions() -> [SpeakerSuggestion] {
         guard let db = peopleDB else { return [] }
-        return (try? db.listSuggestions()) ?? []
+        let live = Set(recordings.filter { !$0.peopleExcluded }.map(\.id))
+        return ((try? db.listSuggestions()) ?? []).filter { live.contains($0.recordingID) }
     }
 
     /// 采纳「疑似某人」：这个人在这条录音里的发言全部归到 TA，并记下样本供以后自动认出。
@@ -301,13 +320,18 @@ extension BeanStore {
                           personID: personID, source: "manual", score: 1, modelVersion: "")
         do {
             try db.insertUtterance(u)
-            // 记一条驳回对：原自动归属（如有）不再反复推荐
             if let oldLocal = localSpeaker {
                 let old = (try? db.listUtterances(recordingID: recordingID)) ?? []
-                if let oldAuto = old.first(where: { $0.localSpeaker == oldLocal && $0.source != "manual" && $0.personID != nil && startMs >= $0.startMs && startMs < $0.endMs }),
-                   let oldPID = oldAuto.personID, oldPID != personID {
-                    try? db.addRejectedPair("\(oldPID.uuidString)|\(recordingID)-\(oldLocal)")
+                let overlapped = old.filter { $0.localSpeaker == oldLocal && $0.startMs < endMs && $0.endMs > startMs }
+                let oldPID = overlapped.first(where: { $0.personID != nil })?.personID
+                // 记一条驳回对：原自动归属（如有）不再反复推荐
+                if let auto = overlapped.first(where: { $0.source != "manual" && $0.personID != nil }), auto.personID != personID {
+                    try? db.addRejectedPair("\(auto.personID!.uuidString)|\(recordingID)-\(oldLocal)")
                 }
+                // 这句从旧说话人的归属与旧人物的代表原声里精确剔除，改归属即时生效
+                try db.carveManualRange(recordingID: recordingID, oldLocalSpeaker: oldLocal,
+                                        oldPersonID: oldPID == personID ? nil : oldPID,
+                                        startMs: startMs, endMs: endMs)
             }
             syncPeopleToLibrary([recordingID])
             reloadPeople()
@@ -345,10 +369,13 @@ extension BeanStore {
         return all.filter { $0.recordingID == nil || live.contains($0.recordingID!) }
     }
 
-    /// 某个人物的声音样本。
+    /// 某个人物的声音样本（排除出「人物」的录音里截出的代表原声不再展示，也点不了试听）。
     func samples(personID: UUID) -> [VoiceSample] {
         guard let db = peopleDB else { return [] }
-        return (try? db.listSamples(personID: personID)) ?? []
+        let live = Set(recordings.filter { !$0.peopleExcluded }.map(\.id))
+        return ((try? db.listSamples(personID: personID)) ?? []).filter {
+            $0.recordingID == nil || live.contains($0.recordingID!)
+        }
     }
 
     /// 某个人物的对话时间线（发言归属 + 录音标题/日期 + 原句）。

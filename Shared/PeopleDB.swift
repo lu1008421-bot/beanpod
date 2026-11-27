@@ -691,6 +691,36 @@ nonisolated final class PeopleDB {
         }
     }
 
+    /// 单句人工改归属后，把这句话的区间从原本地说话人的归属与旧人物的代表原声里精确剔除：
+    /// 完全落在区间里的整条删除，部分重叠的裁掉重叠段（必要时一分为二）；
+    /// 旧人物名下、来自该录音、与区间重叠的代表原声一并删除（它已经不再是干净的「这个人」的声音）。
+    /// 其它说话人、其它时间区间、以及目标人物名下的数据一律不动。
+    func carveManualRange(recordingID: UInt32, oldLocalSpeaker: Int, oldPersonID: UUID?, startMs: Int, endMs: Int) throws {
+        try transaction {
+            let overlapped = try listUtterances(recordingID: recordingID)
+                .filter { $0.localSpeaker == oldLocalSpeaker && $0.endMs > startMs && $0.startMs < endMs }
+            for u in overlapped {
+                if u.startMs >= startMs && u.endMs <= endMs {
+                    try update("DELETE FROM utterances WHERE id=?;", args: [u.id.uuidString])
+                } else if u.startMs < startMs && u.endMs > endMs {
+                    try update("UPDATE utterances SET end_ms=? WHERE id=?;", args: [String(startMs), u.id.uuidString])
+                    let right = Utterance(id: UUID(), recordingID: u.recordingID, audioFingerprint: u.audioFingerprint,
+                                          startMs: endMs, endMs: u.endMs, localSpeaker: u.localSpeaker, overlap: u.overlap,
+                                          personID: u.personID, source: u.source, score: u.score, modelVersion: u.modelVersion)
+                    try insertUtterance(right)
+                } else if u.startMs < startMs {
+                    try update("UPDATE utterances SET end_ms=? WHERE id=?;", args: [String(startMs), u.id.uuidString])
+                } else {
+                    try update("UPDATE utterances SET start_ms=? WHERE id=?;", args: [String(endMs), u.id.uuidString])
+                }
+            }
+            if let oldPersonID {
+                try update("DELETE FROM voice_samples WHERE person_id=? AND recording_id=? AND source_kind='recordingSpan' AND end_ms>? AND start_ms<?;",
+                           args: [oldPersonID.uuidString, String(recordingID), String(startMs), String(endMs)])
+            }
+        }
+    }
+
     private struct MergeSnapshot: Codable {
         struct PersonFields: Codable {
             var displayName: String
