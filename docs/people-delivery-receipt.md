@@ -25,6 +25,7 @@
 | `42aab83` | 返工三 | 代表原声按段入库；采纳建议只并自己的待认识卡；存量录音补分人；多人短对话不判灵感 |
 | `f734dee` | 返工三 | 人物页试听可切回停止态；空库显示「我的声音」；返回条快捷键改 ⌘←；补 7 项回归单测 |
 | `d7bcf03` | 返工三补充 | 试听状态首尾 0.25s 容差、只在真正播放这条这段时显示「停」、暂停即清试听状态；空库「我的声音」贴底；返回条快捷键改 ⌘⌥[；补容差单测 |
+| `977c356` | 最终验收收口 | 修复人工 UI 实测 4 处问题：待认识→文字稿→返回选错人、单句改归属后旧卡仍播同句、排除录音后待认识卡仍显示、QA 启动命令加 `-demo`；新增 2 项 `carveManualRange` 单测 |
 
 ## 2. 构建与测试（本机实测，交付前最后一轮原始结果）
 
@@ -32,7 +33,7 @@
 swift test                                         # Test run with 22 tests passed
 xcodebuild -project BeanPod.xcodeproj -scheme PeopleDBTests \
   -destination 'platform=macOS' -derivedDataPath build/people-tests \
-  CODE_SIGNING_ALLOWED=NO test                     # Executed 37 tests, with 0 failures（PeopleDB 12 + SpeakerMatcher 6 + PeoplePipeline 19）
+  CODE_SIGNING_ALLOWED=NO test                     # Executed 39 tests, with 0 failures（PeopleDB 12 + SpeakerMatcher 6 + PeoplePipeline 21）
 xcodebuild -project BeanPod.xcodeproj -scheme BeanPod \
   -destination 'platform=macOS' -derivedDataPath build/friends-qa \
   CODE_SIGNING_ALLOWED=NO build                    # BUILD SUCCEEDED
@@ -48,11 +49,13 @@ PeoplePipeline 的 19 项单测覆盖：名单合并不丢模型提及人名、�
 
 返工三补充（`d7bcf03`）后重跑，结果不变：`swift test` 22/22、PeopleDBTests 37/37（0 failures）、BeanPod Mac 与 BeanPodMobile iOS 模拟器均 BUILD SUCCEEDED。试听状态新增首尾容差断言（9.99/20.1 不清、8.0 清）。
 
+最终验收收口（`977c356`）后重跑，`swift test` 22/22、PeopleDBTests 39/39（0 failures；新增 2 项 `carveManualRange`：单句改归属后旧卡只剩另一句且代表原声删空、部分重叠一分为二）、BeanPod Mac 与 BeanPodMobile iOS 模拟器均 BUILD SUCCEEDED。
+
 ## 3. 功能开关与关闭方式
 
 - 人物模块为常驻一级入口（侧栏「人物」）；无声纹模型时自动回退原整段转写，不影响原有功能。
 - 声纹链路：`Settings → 模型` 的「说话人识别（声纹）」下载卡（`SpeakerModels.defaults` = 分割 + CAM++），下载后自动启用路径 A；不下载则仅手动维护人物。
-- 隔离库：`--args -data-dir <绝对路径>` 或环境变量 `BEANPOD_DATA_DIR`，优先于默认路径；CLI 同样读该环境变量。
+- 隔离库：`--args -demo -data-dir <绝对路径>`（`-demo` 关蓝牙/MCP/飞书，`-data-dir` 指临时库，二者缺一不可；只传 `-data-dir` 仍会连录音豆）或环境变量 `BEANPOD_DATA_DIR`；CLI 同样读该环境变量。
 
 ## 4. 模型来源与存放
 
@@ -101,7 +104,27 @@ PeoplePipeline 的 19 项单测覆盖：名单合并不丢模型提及人名、�
 - 第 6 节的实跑是返工二的数据。返工三改了代表样本的存法（一张卡最多 3 段）、采纳建议、试听状态和存量录音补分人，这些都**没有在 App 里实跑**。
 - 分人模型把「我们下面播放一条雷军的测试音频」和「这个就是所有的测试音频」聚成同一簇（余弦 0.78）；speaker-lab 单跑结果与 App 内归属逐段一致，不是对齐环节的问题。
 
-## 7. A01–A13 逐项结论
+## 7. 最终验收收口（人工 UI 实测 4 处修复 + P5 真实模型实跑）
+
+### 7.1 人工 UI 实测 4 处修复（`977c356`）
+
+1. 待认识→文字稿→返回选错人：删除 detailPane 兜底 `.onAppear` 与 body 恢复逻辑的竞态，body `.onAppear` 统一「恢复选中 + 待认识人展开 + 无选中默认第一个」，新增 `BeanStore.personVisible(_:)`。
+2. 单句改归属后旧卡仍播同句：`reassignSegment` 新增 `PeopleDB.carveManualRange`（完全落在区间删整条、部分重叠裁剪或一分为二、删旧人物该录音重叠代表样本），即时剔除旧自动归属与旧代表原声。
+3. 排除录音后待认识卡仍显示可播：`pendingPeople`/`samples`/`suggestions` 过滤 `peopleExcluded`，卡片唯一来源被排除后退出待认识列表。
+4. QA 启动命令：`-data-dir` 单独使用时仍连设备；统一改为 `--args -demo -data-dir <独立测试目录>`（仅注释/文档，无代码逻辑改动）。
+
+### 7.2 P5 人物摘要真实模型实跑（隔离库，未碰正式录音库）
+
+- 模型：`Qwen3-4B-Q4_K_M.gguf`（2,497,280,256 B），SHA-256 `7485fe6f…`（与 `Pipeline.swift` 声明一致），经 hf-mirror 下载并校验通过。
+- 直连 llama-server 实测：`/health` ok；`/chat/completions`（`temperature 0.2` + `response_format=json_object` + `enable_thinking:false` + `model=local`）返回合法 `{"updates":[{person,kind,text,segment_indices}]}`。
+- App 全链路（`--args -demo -data-dir /tmp/beanpod-qa-p5`，`llamaServerPath` 指向 `~/.local/bin/llama-server`）：第 1 条 `conv1.wav` 89.5s（公开四人样本拼接两人）Qwen3-ASR 转写 12 句 → 分人 2 人 → 建 2 张待认识卡 → Qwen3-4B 出纪要 → Qwen3-4B 抽人物摘要 2 条（topic，`start_ms/end_ms` 由 `segment_indices` 反查，与所属说话人句号/时间精确对应）；第 2 条 `conv2.wav` 70.7s 同一报幕声**跨录音自动认出**归入同卡（`last_met_at` 更新），另一声音归入第二张卡。全程 LocalLLM 与 SpeakerEngine/QwenASR 串行运行无 OOM、无崩溃（模型用后即停），`person_insights` 落库 2 条且 `segment_indices` 有效，界面定位依赖的起止时间已正确反查（点击未实跑）。
+- 备注：`conv2` 内容为同一测试句重复，Qwen3-4B 未产出新人物摘要（非错误；`replaceAutoInsights` 按录音隔离，第 1 条摘要保留）。
+
+### 7.3 真实样本阈值校准（阻塞）
+
+第 3 项要求用 3–5 条真实近场/外放/多天录音跑 speaker-lab 的 CAM++/ERes2Net 同异人余弦、auto/suggest/newPerson 命中率、误归率与建议阈值，但原文「测试音频路径」是未填占位符，且约束严禁扫描正式录音库。**未获授权路径，此项未执行**；需用户提供授权录音路径后再补 `docs/speaker-experiment.md` 与第 4 节放行统计。
+
+## 8. A01–A13 逐项结论
 
 图例：✅ 已验证 · ◐ 部分验证/代码就绪未实测界面 · ✖ 未验证
 
@@ -117,18 +140,19 @@ PeoplePipeline 的 19 项单测覆盖：名单合并不丢模型提及人名、�
 | A08 | ◐ | 坏文件 reject、无模型回退已实现；取消/断点重试未实测。 |
 | A09 | ◐ | 重转写后 `manual` 区间按时间交集映射回新句子已有单测；回收站级联有测试。界面重转写未实测。 |
 | A10 | ✅ | `-data-dir` / `BEANPOD_DATA_DIR` 实跑通过，CLI 同步读到隔离库；老库向后兼容有测试。 |
-| A11 | ◐ | `Navigator` 跳转、`tab=1` 高亮滚动、返回条已实现并编译通过；屏幕锁定，未在界面上点过。 |
-| A12 | ◐ | ≥1 小时分窗实测 RTF 0.052、峰值 536 MB、跨窗标签一致。仍是整条常驻内存，未做文件流式，见第 8 节。 |
-| A13 | ◐ | 删样本同时删磁盘文件、内容哈希去重、洞察编辑/软删、单条排除均已实现并有单测；试听「听 / 停」切换只有状态层的单测；界面未实测。 |
+| A11 | ◐ | 人工 UI 实测发现「待认识→文字稿→返回选错人、列表收起」并修复（`977c356`：body 统一恢复选中+展开、删 detailPane 兜底竞态）；跨页高亮/返回条仍待最终人工回归确认。 |
+| A12 | ◐ | ≥1 小时分窗实测 RTF 0.052、峰值 536 MB、跨窗标签一致。仍是整条常驻内存，未做文件流式，见第 9 节。 |
+| A13 | ◐ | 人工 UI 实测发现「单句改归属后旧卡仍播同句」「排除录音后待认识卡仍显示可播」并修复（`977c356`，新增 `carveManualRange` 单测）；删样本/洞察编辑/软删/试听状态已有单测，仍待最终人工回归确认。 |
 
-## 8. 剩余问题（如实标注）
+## 9. 剩余问题（如实标注）
 
-1. **界面交互全部未实测**：待认识卡试听与停止、出现语境、疑似确认（合并/驳回）、「我的声音」、样本抽屉播放、洞察编辑、单条排除开关、跨页高亮与返回条——都只做到编译通过（屏幕锁定）。下一轮需先人工过一遍人物页。
-2. **返工三的改动没有在 App 里实跑**：代表样本按段入库、采纳建议只并自己的卡、试听状态、存量录音补分人、多人短对话不判灵感，都只有单测 + 构建。
+1. **修复后的最终人工回归待执行**：本轮人工 UI 实测发现 4 处问题已修（`977c356`，见第 7.1 节），但修复本身尚未再经人工界面回归；待认识卡试听、疑似确认（合并/驳回）、「我的声音」、样本抽屉播放、洞察编辑、单条排除开关、跨页高亮与返回条等其余界面项也仍待逐项点验。
+2. **返工三的改动只部分在 App 里实跑**：4 处 UI Bug 经人工实测发现并修复；代表样本按段入库、采纳建议只并自己的卡、存量录音补分人、多人短对话不判灵感仍只有单测 + 构建。
 3. **存量录音补分人要手动触发**：对升级前转写好的录音点「重新整理纪要」时，才会补一次分人（本地有 WAV 且人物库里没有它的发言记录）。1 小时录音约 3 分钟。分不出人（全是静音等）的录音每次整理都会重试。
 4. **1 小时录音的采样仍整条常驻内存**（约 233 MB），没有做成按窗口从文件流式读；分窗分人 RTF 0.052，是不分窗的 1.4 倍。
-5. **分人聚类在短句上会并簇**（见第 6 节），会让「一个人」的声纹混进另一个人的向量。真实录音上的影响待校准。
-6. **P5 人物摘要未实跑**：本机 Qwen3-4B 未下载；串行化改动只有编译与代码路径保证。
+5. **分人聚类在短句上会并簇**（见第 6 节），会让「一个人」的声纹混进另一个人的向量。真实录音上的影响待按第 7.3 节校准（本轮公开样本 P5 实跑也见跨录音自动认人把两个不同测试句归入同卡，提示 auto 阈值 0.60 对干净短句可能偏宽松，需真实样本校准）。
+6. **P5 人物摘要已实跑**（见第 7.2 节）：Qwen3-4B 本机跑通，`segment_indices` 反查落库正确。
 7. **路径 B（云端/系统/已有文字稿）只有单测**，没有真实云端转写样本可跑。
-8. **疑似确认（`speaker_suggestion`）实跑未触发**：上一轮 4 条录音里没有落进 suggest 档的匹配，合并/驳回流程只有单测覆盖。
-9. **返工三补充的三处界面/播放小 Bug 已修但未在界面上点过**：试听「听/停」首帧抖动、空库侧栏 50/50 竖分、返回条 ⌘← 劫持文本行首——代码 + 单测（`testSpanPlaybackTracksActiveSpan` 容差分支）已过，仍待人工 UI 实测。
+8. **疑似确认（`speaker_suggestion`）实跑未触发**：现有样本里没有落进 suggest 档的匹配，合并/驳回流程只有单测覆盖。
+9. **返工三补充的三处界面/播放小 Bug 已人工实测并修复**（试听「听/停」首帧抖动、空库侧栏 50/50 竖分、返回条 ⌘← 劫持文本行首），见第 7.1 节。
+10. **真实样本阈值校准未执行**：用户未提供真实近场/外放/多天录音路径（原文为未填占位符），且严禁扫描正式录音库；第 4 节放行统计待路径。
