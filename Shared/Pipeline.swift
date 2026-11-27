@@ -150,21 +150,41 @@ extension BeanStore {
                     }
                     engine = "云端 · \(asr.model)"
                 } else if settings.engine == .qwen, asrAvailable {
+                    #if os(macOS)
+                    // 路径 A：声纹链路就绪、且这条录音该自动认人时，先分人再按说话人边界切块转写
+                    if rec.eligibleForAutoSpeaker, speakerPipelineReady {
+                        segments = try await transcribeWithSpeakers(id) { fraction in
+                            Task { @MainActor [weak self] in
+                                if case .transcribing = self?.stages[id] { self?.stages[id] = .transcribing(fraction) }
+                            }
+                        }
+                        engine = QwenASR.displayName + " · 声纹分人"
+                    } else {
+                        segments = try await QwenASR.shared.transcribe(wavURL(id), serverPath: settings.llamaServerPath) { fraction in
+                            Task { @MainActor [weak self] in
+                                if case .transcribing = self?.stages[id] { self?.stages[id] = .transcribing(fraction) }
+                            }
+                        }
+                        engine = QwenASR.displayName
+                    }
+                    #else
                     segments = try await QwenASR.shared.transcribe(wavURL(id), serverPath: settings.llamaServerPath) { fraction in
                         Task { @MainActor [weak self] in
                             if case .transcribing = self?.stages[id] { self?.stages[id] = .transcribing(fraction) }
                         }
                     }
                     engine = QwenASR.displayName
+                    #endif
                 } else {
                     let text = try await Transcriber.transcribe(wavURL(id), language: settings.language)
                     segments = text.isEmpty ? [] : [Segment(start: 0, text: text)]
                     engine = "系统语音识别"
                 }
                 guard let i = index(id) else { return }
-                recordings[i].segments = segments.map { Segment(start: $0.start, text: applyVocabulary($0.text)) }
+                recordings[i].segments = segments.map { Segment(start: $0.start, text: applyVocabulary($0.text), speaker: $0.speaker, end: $0.end) }
                 recordings[i].transcript = recordings[i].segments.map(\.text).joined(separator: "\n")
                 recordings[i].transcribedBy = engine
+                syncLocalSpeakers(id, from: segments)
                 saveLibrary()
             } catch {
                 let kept = !(rec.transcript ?? "").isEmpty

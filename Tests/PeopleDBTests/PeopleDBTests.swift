@@ -143,4 +143,34 @@ final class PeopleDBTests: XCTestCase {
         XCTAssertEqual(try db.listUtterances(recordingID: 7).count, 1)
         XCTAssertEqual(try db.listUtterances(recordingID: 7)[0].id, u1.id)
     }
+
+    /// 彻底删除一条录音时，级联清掉它的发言、资料与源自它的声音样本；独立导入的样本不受影响。
+    func testDeleteRecordingDataCascades() throws {
+        let db = try openDB()
+        let p = try db.createPerson(displayName: "李四", status: .confirmed)
+        let recSample = VoiceSample(
+            id: UUID(), personID: p.id, sourceKind: .recordingSpan, recordingID: 42,
+            startMs: 0, endMs: 3000, managedFile: nil, channel: .nearField,
+            confirmed: false, modelVersion: "cam++", contentHash: "r")
+        let imported = VoiceSample(
+            id: UUID(), personID: p.id, sourceKind: .importedFile, recordingID: nil,
+            startMs: 0, endMs: 5000, managedFile: nil, channel: .nearField,
+            confirmed: true, modelVersion: "cam++", contentHash: "i")
+        try db.addSample(recSample, embedding: nil)
+        try db.addSample(imported, embedding: nil)
+        try db.upsertInsight(PersonInsight(
+            id: UUID(), personID: p.id, kind: .commitment, text: "下周交报告",
+            recordingID: 42, startMs: 1000, endMs: 2000, occurredAt: .now,
+            editedByUser: false, modelVersion: "v1", stale: false))
+        let u = Utterance(id: UUID(), recordingID: 42, audioFingerprint: "f", startMs: 0, endMs: 3000, localSpeaker: 0, overlap: false, personID: p.id, source: "auto", score: 0.9, modelVersion: "v1")
+        try db.replaceUtterances(recordingID: 42, [u])
+
+        try db.deleteRecordingData(recordingID: 42)
+
+        XCTAssertTrue(try db.listUtterances(recordingID: 42).isEmpty, "该录音的发言应清空")
+        XCTAssertTrue(try db.listInsights(personID: p.id).isEmpty, "该录音的资料应清空")
+        let samples = try db.listSamples(personID: p.id)
+        XCTAssertEqual(samples.count, 1, "只应留下独立导入的样本")
+        XCTAssertEqual(samples[0].id, imported.id)
+    }
 }

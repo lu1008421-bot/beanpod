@@ -488,6 +488,16 @@ nonisolated final class PeopleDB {
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
     }
 
+    /// 级联删除一条录音的派生数据（发言归属、人物资料、源自该录音的声音样本）。
+    /// 独立导入的音频样本不在此列（其 `recording_id` 为空）。
+    func deleteRecordingData(recordingID: UInt32) throws {
+        try transaction {
+            try update("DELETE FROM utterances WHERE recording_id=?;", args: [String(recordingID)])
+            try update("DELETE FROM person_insights WHERE recording_id=?;", args: [String(recordingID)])
+            try update("DELETE FROM voice_samples WHERE recording_id=?;", args: [String(recordingID)])
+        }
+    }
+
     // MARK: - 人物资料与往来
 
     func upsertInsight(_ insight: PersonInsight) throws {

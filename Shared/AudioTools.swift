@@ -87,6 +87,23 @@ extension QwenASR {
         return (e / Float(s.count)).squareRoot()
     }
 
+    /// 把一长段采样按固定窗长 + 重叠步进切成连续窗口（供长音频分窗分割/转写，避免整段常驻内存）。
+    /// 返回每个窗口的样本下标区间。末尾不足一个窗也返回。
+    nonisolated static func windowedRanges(sampleCount: Int, rate: Int = 16000, windowSeconds: Double = 300, overlapSeconds: Double = 30) -> [Range<Int>] {
+        let window = Int(windowSeconds * Double(rate))
+        let step = max(1, Int((windowSeconds - overlapSeconds) * Double(rate)))
+        guard sampleCount > 0, window > 0, step > 0 else { return [] }
+        var out: [Range<Int>] = []
+        var start = 0
+        while start < sampleCount {
+            let end = min(sampleCount, start + window)
+            out.append(start..<end)
+            if end >= sampleCount { break }
+            start += step
+        }
+        return out
+    }
+
     nonisolated static func wav(_ samples: [Float], rate: Int = 16000) -> Data {
         var d = Data(capacity: 44 + samples.count * 2)
         func u32(_ v: Int) { withUnsafeBytes(of: UInt32(v).littleEndian) { d.append(contentsOf: $0) } }
