@@ -162,6 +162,15 @@ nonisolated enum SpeakerAlignment {
         }
     }
 
+    /// 句子只有开头时间（老文字稿 / 部分云端转写）时补出区间：句尾用下一句的开头，最后一句用到录音结束。
+    static func withEnds(_ segments: [(start: Double, end: Double?)], duration: Double) -> [Span] {
+        segments.enumerated().map { n, s in
+            let next = n + 1 < segments.count ? segments[n + 1].start : duration
+            let end = s.end ?? next
+            return Span(start: s.start, end: max(s.start + 0.01, end))
+        }
+    }
+
     /// 重转写后，保留下来的人工区间重新套到新句子上：中点落在人工区间内的句子用人工指定的说话人槽位。
     static func applyManual(segments: [Span], manual: [(span: Span, speaker: Int)]) -> [Int?] {
         segments.map { seg in
@@ -197,6 +206,9 @@ nonisolated enum WindowLinker {
         var centroids: [Int: [Float]]
         /// 只有中点不早于这个时刻的区间才算这个窗口的（前面那截和上一个窗口重叠，归上一个窗口，免得重复）。
         var keepFrom: Double
+        /// 这一窗在音频里的结束时刻。贴着它结束的区间是被窗尾截出来的半句：下一窗里要是有同一个人的重叠区间，
+        /// 就只留下一窗那份完整的。最后一窗没有下一窗，为 nil。
+        var cutAt: Double? = nil
     }
 
     static let linkThreshold: Float = 0.60
@@ -205,8 +217,8 @@ nonisolated enum WindowLinker {
     static func merge(_ windows: [Window], cosine: ([Float], [Float]) -> Float) -> [Turn] {
         var centroids: [[Float]] = []
         var counts: [Int] = []
-        var out: [Turn] = []
-        for w in windows {
+        // 先把每一窗的本地编号都映射成全篇编号（只跟中心向量有关），再去重
+        let maps: [[Int: Int]] = windows.map { w in
             var map: [Int: Int] = [:]
             for (local, c) in w.centroids.sorted(by: { $0.key < $1.key }) {
                 let best = centroids.indices.max { cosine(centroids[$0], c) < cosine(centroids[$1], c) }
@@ -221,7 +233,24 @@ nonisolated enum WindowLinker {
                     map[local] = centroids.count - 1
                 }
             }
-            out += w.turns.filter { ($0.start + $0.end) / 2 >= w.keepFrom }.map { Turn(start: $0.start, end: $0.end, speaker: map[$0.speaker] ?? $0.speaker) }
+            return map
+        }
+        var out: [Turn] = []
+        for (n, w) in windows.enumerated() {
+            for turn in w.turns {
+                // 开头重叠区归上一窗
+                guard (turn.start + turn.end) / 2 >= w.keepFrom else { continue }
+                // 窗尾截出来的半句：下一窗里有同一个人的重叠区间就只留下一窗那份
+                // （截断会改变中点，光靠中点划界挡不住它；留 0.5 秒容差是因为模型的分段点不一定正好落在窗尾）
+                if let cut = w.cutAt, turn.end >= cut - 0.5, n + 1 < windows.count,
+                   let g = maps[n][turn.speaker],
+                   windows[n + 1].turns.contains(where: { next in
+                       next.start < turn.end && next.end > turn.start
+                           && (next.start + next.end) / 2 >= windows[n + 1].keepFrom
+                           && maps[n + 1][next.speaker] == g
+                   }) { continue }
+                out.append(Turn(start: turn.start, end: turn.end, speaker: maps[n][turn.speaker] ?? turn.speaker))
+            }
         }
         return out.sorted { $0.start < $1.start }
     }

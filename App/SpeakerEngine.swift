@@ -81,14 +81,27 @@ actor SpeakerEngine {
     /// 不依赖 `ffmpeg`。供说话人分割与声纹提取统一使用。
     nonisolated static func loadMono16k(_ url: URL) throws -> [Float] {
         guard let file = try? AVAudioFile(forReading: url),
-              let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-              let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+              let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false) else {
+            throw SpeakerEngineError.badAudio
+        }
+        if file.processingFormat.sampleRate == 16000, file.processingFormat.channelCount == 1 {
+            // 原样就是 16k 单声道：分块读进一个数组。整段读进缓冲再拷一份的话，1 小时录音要多占 200 多 MB
+            let chunk: AVAudioFrameCount = 16000 * 30
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunk),
+                  let d = buffer.floatChannelData else { throw SpeakerEngineError.badAudio }
+            var out = [Float]()
+            out.reserveCapacity(Int(file.length))
+            while file.framePosition < file.length {
+                try file.read(into: buffer, frameCount: chunk)
+                if buffer.frameLength == 0 { break }
+                out.append(contentsOf: UnsafeBufferPointer(start: d[0], count: Int(buffer.frameLength)))
+            }
+            return out
+        }
+        guard let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
             throw SpeakerEngineError.badAudio
         }
         try file.read(into: input)
-        if file.processingFormat.sampleRate == 16000, file.processingFormat.channelCount == 1, let d = input.floatChannelData {
-            return Array(UnsafeBufferPointer(start: d[0], count: Int(input.frameLength)))
-        }
         guard let converter = AVAudioConverter(from: file.processingFormat, to: target),
               let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: AVAudioFrameCount(Double(input.frameLength) * 16000 / file.processingFormat.sampleRate) + 1024) else {
             throw SpeakerEngineError.badAudio
@@ -119,10 +132,9 @@ actor SpeakerEngine {
         let d = ensureDiarizer(segmentation: segURL, embedding: embURL, numClusters: numClusters, threshold: threshold, numThreads: numThreads)
         guard let d else { return [] }
 
-        let single = Self.markOverlaps(d.process(samples: samples).map { DiarizedSegment(start: Double($0.start), end: Double($0.end), speaker: $0.speaker) })
-        // 长录音：分窗推理，内存只跟窗口大小有关，不跟整条录音走
+        // 长录音：分窗推理，内存只跟窗口大小有关，不跟整条录音走。先按长度选路线，不一整遍跑完再丢
         if samples.count > Int(Self.windowSeconds * 16000) + 1600 { return diarizeWindowed(samples: samples, diarizer: d) }
-        return single
+        return Self.markOverlaps(d.process(samples: samples).map { DiarizedSegment(start: Double($0.start), end: Double($0.end), speaker: $0.speaker) })
     }
 
     /// 分窗参数：每窗 5 分钟，相邻窗重叠 30 秒。
@@ -165,7 +177,8 @@ actor SpeakerEngine {
                 if len > 0 { centroids[spk] = s.map { $0 / len } }
             }
             windows.append(WindowLinker.Window(turns: local.map { WindowLinker.Turn(start: $0.start, end: $0.end, speaker: $0.speaker) },
-                                               centroids: centroids, keepFrom: n == 0 ? 0 : t0 + Self.windowOverlap))
+                                               centroids: centroids, keepFrom: n == 0 ? 0 : t0 + Self.windowOverlap,
+                                               cutAt: r.upperBound >= samples.count ? nil : t0 + Self.windowSeconds))
         }
         let linked = WindowLinker.merge(windows) { Self.cosine($0, $1) }
         return Self.markOverlaps(linked.map { DiarizedSegment(start: $0.start, end: $0.end, speaker: $0.speaker) })
