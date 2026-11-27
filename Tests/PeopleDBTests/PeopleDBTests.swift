@@ -173,4 +173,37 @@ final class PeopleDBTests: XCTestCase {
         XCTAssertEqual(samples.count, 1, "只应留下独立导入的样本")
         XCTAssertEqual(samples[0].id, imported.id)
     }
+
+    /// 两卡合并把样本/发言/资料归主卡、删次卡；撤销后次卡连同原有派生数据原样还原。
+    func testMergeAndUndoMerge() throws {
+        let db = try openDB()
+        let a = try db.createPerson(displayName: "陈工", status: .confirmed)
+        let b = try db.createPerson(displayName: "陈总", status: .confirmed)
+        let sample = VoiceSample(
+            id: UUID(), personID: b.id, sourceKind: .recordingSpan, recordingID: 8,
+            startMs: 0, endMs: 3000, managedFile: nil, channel: .nearField,
+            confirmed: true, modelVersion: "cam++", contentHash: "b")
+        try db.addSample(sample, embedding: [0.5])
+        try db.upsertInsight(PersonInsight(
+            id: UUID(), personID: b.id, kind: .topic, text: "聊了报价",
+            recordingID: 8, startMs: 0, endMs: 3000, occurredAt: .now,
+            editedByUser: false, modelVersion: "v1", stale: false))
+        let u = Utterance(id: UUID(), recordingID: 8, audioFingerprint: "f", startMs: 0, endMs: 3000, localSpeaker: 1, overlap: false, personID: b.id, source: "auto", score: 0.9, modelVersion: "v1")
+        try db.replaceUtterances(recordingID: 8, [u])
+
+        let logID = try db.mergePersons(primary: a.id, secondary: b.id)
+        XCTAssertNil(try db.person(id: b.id), "次卡应删除")
+        XCTAssertEqual(try db.listSamples(personID: a.id).count, 1)
+        XCTAssertEqual(try db.listInsights(personID: a.id).count, 1)
+        XCTAssertEqual(try db.listUtterancesForPerson(personID: a.id).count, 1)
+
+        try db.undoMerge(logID: logID)
+        guard let restored = try db.person(id: b.id) else { return XCTFail("撤销后次卡应还原") }
+        XCTAssertEqual(restored.displayName, "陈总")
+        XCTAssertEqual(restored.strangerIndex, b.strangerIndex, "撤销应沿用原编号，不占用新编号")
+        XCTAssertEqual(try db.listSamples(personID: b.id).count, 1)
+        XCTAssertEqual(try db.listInsights(personID: b.id).count, 1)
+        XCTAssertEqual(try db.listUtterancesForPerson(personID: b.id).count, 1)
+        XCTAssertEqual(try db.listSamples(personID: a.id).count, 0)
+    }
 }

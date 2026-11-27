@@ -301,6 +301,16 @@ nonisolated final class PeopleDB {
         try update("DELETE FROM persons WHERE id=?;", args: [id.uuidString])
     }
 
+    /// 删除人物卡并级联清掉其声音样本、发言归属与资料。
+    func deletePersonCascade(id: UUID) throws {
+        try transaction {
+            try update("DELETE FROM voice_samples WHERE person_id=?;", args: [id.uuidString])
+            try update("DELETE FROM utterances WHERE person_id=?;", args: [id.uuidString])
+            try update("DELETE FROM person_insights WHERE person_id=?;", args: [id.uuidString])
+            try update("DELETE FROM persons WHERE id=?;", args: [id.uuidString])
+        }
+    }
+
     private func queryPersons(_ sql: String) throws -> [Person] {
         guard let db else { throw Error.openFailed("not open") }
         var stmt: OpaquePointer?
@@ -546,6 +556,172 @@ nonisolated final class PeopleDB {
 
     func deleteInsight(id: UUID) throws {
         try update("DELETE FROM person_insights WHERE id=?;", args: [id.uuidString])
+    }
+
+    // MARK: - 时间线、纠错与合并
+
+    /// 某个人物名下的全部发言归属（按录音、时间排序）。
+    func listUtterancesForPerson(personID: UUID) throws -> [Utterance] {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        let sql = "SELECT id,recording_id,audio_fingerprint,start_ms,end_ms,local_speaker,overlap,person_id,source,score,model_version FROM utterances WHERE person_id='\(personID.uuidString)' ORDER BY recording_id, start_ms;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        var out: [Utterance] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append(Utterance(
+                id: UUID(uuidString: text(stmt, 0)) ?? UUID(),
+                recordingID: UInt32(sqlite3_column_int64(stmt, 1)),
+                audioFingerprint: text(stmt, 2),
+                startMs: Int(sqlite3_column_int64(stmt, 3)),
+                endMs: Int(sqlite3_column_int64(stmt, 4)),
+                localSpeaker: Int(sqlite3_column_int64(stmt, 5)),
+                overlap: sqlite3_column_int(stmt, 6) != 0,
+                personID: sqlite3_column_type(stmt, 7) == SQLITE_NULL ? nil : UUID(uuidString: text(stmt, 7)),
+                source: text(stmt, 8),
+                score: sqlite3_column_double(stmt, 9),
+                modelVersion: text(stmt, 10)))
+        }
+        return out
+    }
+
+    /// 批量改发言归属（同批纠正）。人工指定优先于自动重跑。
+    func assignUtterances(_ ids: [UUID], personID: UUID?, source: String) throws {
+        guard !ids.isEmpty else { return }
+        try transaction {
+            for id in ids { try assignUtterance(id: id, personID: personID, source: source) }
+        }
+    }
+
+    private struct MergeSnapshot: Codable {
+        struct PersonFields: Codable {
+            var displayName: String
+            var strangerIndex: Int
+            var colorIndex: Int
+            var status: String
+            var isMe: Bool
+            var note: String
+            var createdAt: TimeInterval
+            var lastMetAt: TimeInterval?
+        }
+        var primary: UUID
+        var secondary: UUID
+        var secondaryFields: PersonFields
+        var samples: [UUID]
+        var utterances: [UUID]
+        var insights: [UUID]
+    }
+
+    private func personIDs(_ sql: String) throws -> [UUID] {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        var out: [UUID] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { if let u = UUID(uuidString: text(stmt, 0)) { out.append(u) } }
+        return out
+    }
+
+    private func insertJob(id: String, kind: String, payload: String?) throws {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        let sql = "INSERT INTO jobs_and_audits(id,kind,input_fingerprint,model_version,rule_version,progress,failure,payload,created_at) VALUES(?,?,NULL,NULL,NULL,NULL,NULL,?,?);"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, id)
+        bind(stmt, 2, kind)
+        bind(stmt, 3, payload)
+        sqlite3_bind_double(stmt, 4, Date.now.timeIntervalSince1970)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    }
+
+    private func jobPayload(id: String) throws -> String? {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        let sql = "SELECT payload FROM jobs_and_audits WHERE id='\(id)';"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return sqlite3_column_type(stmt, 0) == SQLITE_NULL ? nil : text(stmt, 0)
+    }
+
+    private func insertPersonSnapshot(id: UUID, s: MergeSnapshot.PersonFields) throws {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        let sql = "INSERT INTO persons(id,display_name,stranger_index,color_index,status,is_me,note,created_at,last_met_at) VALUES(?,?,?,?,?,?,?,?,?);"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, id.uuidString)
+        bind(stmt, 2, s.displayName)
+        sqlite3_bind_int64(stmt, 3, Int64(s.strangerIndex))
+        sqlite3_bind_int64(stmt, 4, Int64(s.colorIndex))
+        bind(stmt, 5, s.status)
+        sqlite3_bind_int(stmt, 6, s.isMe ? 1 : 0)
+        bind(stmt, 7, s.note)
+        sqlite3_bind_double(stmt, 8, s.createdAt)
+        if let lm = s.lastMetAt { sqlite3_bind_double(stmt, 9, lm) } else { sqlite3_bind_null(stmt, 9) }
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    }
+
+    /// 把次要人物合并进主要人物（样本/发言/资料归主卡，删次要卡），返回 merge_log 编号供撤销。
+    @discardableResult
+    func mergePersons(primary: UUID, secondary: UUID) throws -> String {
+        guard primary != secondary else { throw Error.sql("不能合并同一个人") }
+        guard let sec = try person(id: secondary) else { throw Error.sql("要合并的人物不存在") }
+        let samples = try personIDs("SELECT id FROM voice_samples WHERE person_id='\(secondary.uuidString)';")
+        let utterances = try personIDs("SELECT id FROM utterances WHERE person_id='\(secondary.uuidString)';")
+        let insights = try personIDs("SELECT id FROM person_insights WHERE person_id='\(secondary.uuidString)';")
+        let logID = UUID().uuidString
+        let snap = MergeSnapshot(
+            primary: primary, secondary: secondary,
+            secondaryFields: .init(displayName: sec.displayName, strangerIndex: sec.strangerIndex, colorIndex: sec.colorIndex,
+                                   status: sec.status.rawValue, isMe: sec.isMe, note: sec.note,
+                                   createdAt: sec.createdAt.timeIntervalSince1970, lastMetAt: sec.lastMetAt?.timeIntervalSince1970),
+            samples: samples, utterances: utterances, insights: insights)
+        let payload = String(data: try JSONEncoder().encode(snap), encoding: .utf8)
+        try transaction {
+            try update("UPDATE voice_samples SET person_id=? WHERE person_id=?;", args: [primary.uuidString, secondary.uuidString])
+            try update("UPDATE utterances SET person_id=? WHERE person_id=?;", args: [primary.uuidString, secondary.uuidString])
+            try update("UPDATE person_insights SET person_id=? WHERE person_id=?;", args: [primary.uuidString, secondary.uuidString])
+            try update("DELETE FROM persons WHERE id=?;", args: [secondary.uuidString])
+            try insertJob(id: logID, kind: "merge_log", payload: payload)
+        }
+        return logID
+    }
+
+    /// 撤销一次合并：重建次要人物（沿用原编号/颜色），把合并前归它的样本/发言/资料挪回，不伤合并后新增的其它内容。
+    func undoMerge(logID: String) throws {
+        guard let payload = try jobPayload(id: logID),
+              let data = payload.data(using: .utf8),
+              let snap = try? JSONDecoder().decode(MergeSnapshot.self, from: data) else {
+            throw Error.sql("找不到这次合并记录")
+        }
+        try transaction {
+            try insertPersonSnapshot(id: snap.secondary, s: snap.secondaryFields)
+            for id in snap.samples { try update("UPDATE voice_samples SET person_id=? WHERE id=? AND person_id=?;", args: [snap.secondary.uuidString, id.uuidString, snap.primary.uuidString]) }
+            for id in snap.utterances { try update("UPDATE utterances SET person_id=? WHERE id=? AND person_id=?;", args: [snap.secondary.uuidString, id.uuidString, snap.primary.uuidString]) }
+            for id in snap.insights { try update("UPDATE person_insights SET person_id=? WHERE id=? AND person_id=?;", args: [snap.secondary.uuidString, id.uuidString, snap.primary.uuidString]) }
+            try update("DELETE FROM jobs_and_audits WHERE id=?;", args: [logID])
+        }
+    }
+
+    /// 尚未撤销的合并记录（供「撤销上次合并」入口）。
+    func pendingMergeLogs() throws -> [(id: String, primary: UUID, secondary: UUID)] {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        let sql = "SELECT id, payload FROM jobs_and_audits WHERE kind='merge_log' ORDER BY created_at DESC;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        var out: [(id: String, primary: UUID, secondary: UUID)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = text(stmt, 0)
+            if sqlite3_column_type(stmt, 1) != SQLITE_NULL,
+               let data = text(stmt, 1).data(using: .utf8),
+               let snap = try? JSONDecoder().decode(MergeSnapshot.self, from: data) {
+                out.append((id, snap.primary, snap.secondary))
+            }
+        }
+        return out
     }
 
     // MARK: - 作业与纠错

@@ -4,7 +4,7 @@ import SwiftUI
 // MARK: - 导航
 
 enum Route: Hashable {
-    case dashboard, all, starred, scene(Scene), knowledge, device
+    case dashboard, all, starred, scene(Scene), knowledge, people, device
     /// 从链接导入的素材。
     case materials
     /// 一个项目里的录音和素材。
@@ -65,6 +65,7 @@ struct RootView: View {
             switch nav.route {
             case .dashboard: DashboardView().background(Backdrop())
             case .knowledge: KnowledgeView().background(Backdrop())
+            case .people: PeopleView().background(Backdrop())
             case .device: DeviceView().background(Backdrop())
             case .trash: TrashView().background(Backdrop())
             case .dictation: DictationView().background(Backdrop())
@@ -322,6 +323,7 @@ struct Sidebar: View {
         case .dashboard: 0
         case .all, .starred, .scene: 1
         case .knowledge: 2
+        case .people: 5
         case .materials: 3
         case .dictation: 4
         case .device, .project, .tag, .trash: -1
@@ -359,6 +361,7 @@ struct Sidebar: View {
                     item(String(localized: "语音输入"), "keyboard", 4, count: store.dictations.count) { nav.route = .dictation }
                 }
                 item(String(localized: "知识库"), "book.closed.fill", 2) { nav.route = .knowledge }
+                item(String(localized: "人物"), "person.2.fill", 5, count: store.pendingPeopleCount) { nav.route = .people }
             }
             projectList.padding(.top, 20)
             SidebarTags().padding(.top, 16)
@@ -2452,6 +2455,27 @@ struct TranscriptView: View {
                 Button(name) { store.setSpeaker(recording.id, start: seg.start, to: n) }
             }
             Button("新增说话人") { store.addSpeaker(recording.id, start: seg.start) }
+            // 改归人物库里已确认的联系人（含「我」）：人工指定优先于重跑模型
+            if !store.confirmedPeople.isEmpty || store.people.contains(where: \.isMe) {
+                Divider()
+                Text("改归人物").font(.caption).foregroundStyle(.secondary)
+                if let me = store.people.first(where: \.isMe) {
+                    Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: me.id) } label: {
+                        Label("我", systemImage: "person.fill")
+                    }
+                } else {
+                    Button {
+                        if let meID = store.createPerson(name: "我", status: .confirmed, isMe: true) {
+                            store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: meID)
+                        }
+                    } label: { Label("标为我", systemImage: "person.fill") }
+                }
+                ForEach(store.confirmedPeople) { p in
+                    Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: p.id) } label: {
+                        Label(p.displayName, systemImage: "person.crop.circle")
+                    }
+                }
+            }
             if let n = seg.speaker, recording.speakers.indices.contains(n) {
                 Divider()
                 Button("改名…") { newName = recording.speakers[n]; renaming = n }
