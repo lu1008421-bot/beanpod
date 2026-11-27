@@ -248,6 +248,11 @@ final class BeanStore {
     @ObservationIgnored var retranscribing: Set<UInt32> = []
     /// 这几条重新转写时走云端（录音页「交给云端重转」），不管平时用哪个引擎。
     @ObservationIgnored var viaCloud: Set<UInt32> = []
+    #if os(macOS)
+    @ObservationIgnored var mcpServerProcess: Process?
+    @ObservationIgnored var mcpTerminateObserver: NSObjectProtocol?
+    var mcpServerRunning = false
+    #endif
 
     private struct PullJob {
         let id: UInt32
@@ -284,7 +289,13 @@ final class BeanStore {
         refreshASRAvailability()
         watchInbox()
         #if os(macOS)
-        if !Self.demo { installCLI(); startMCPServer() }
+        if !Self.demo {
+            installCLI()
+            if settings.httpMCPEnabled { startMCPServer() }
+            mcpTerminateObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.stopMCPServer() }
+            }
+        }
         #endif
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))

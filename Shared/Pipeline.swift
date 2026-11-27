@@ -840,6 +840,46 @@ extension BeanStore {
         return FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
     }
 
+    var mcpMaskedAddress: String { "\(Self.mcpAddress)?token=••••••••" }
+
+    func mcpToken(createIfMissing: Bool = false) -> String {
+        let existing = Keychain.get("mcpToken")
+        if MCPHTTPPolicy.isValidTokenFormat(existing) { return existing }
+        guard createIfMissing else { return "" }
+        let fresh = MCPHTTPPolicy.generateToken()
+        guard Keychain.set(fresh, for: "mcpToken") else {
+            addLog("无法将本机 HTTP MCP 令牌存入钥匙串")
+            return ""
+        }
+        return fresh
+    }
+
+    func mcpAuthenticatedAddress() -> String? {
+        let token = mcpToken(createIfMissing: true)
+        guard !token.isEmpty else { return nil }
+        return "\(Self.mcpAddress)?token=\(token)"
+    }
+
+    func setHTTPMCPEnabled(_ enabled: Bool) {
+        settings.httpMCPEnabled = enabled
+        if enabled { startMCPServer() } else { stopMCPServer() }
+    }
+
+    @discardableResult
+    func rotateMCPToken() -> Bool {
+        let fresh = MCPHTTPPolicy.generateToken()
+        guard Keychain.set(fresh, for: "mcpToken") else {
+            addLog("重置本机 HTTP MCP 令牌失败")
+            return false
+        }
+        addLog("已重置本机 HTTP MCP 令牌")
+        if settings.httpMCPEnabled {
+            stopMCPServer()
+            startMCPServer()
+        }
+        return true
+    }
+
     /// 把 App 自带的命令行工具装到 ~/.local/bin/beanpod（AI 助手的 MCP 配置指向这里）。
     /// 没装或和自带的不一样（App 升级了）才复制。要先删再拷：原地覆盖会让新文件一启动就被系统杀掉。
     @discardableResult
@@ -860,16 +900,47 @@ extension BeanStore {
         }
     }
 
-    /// 豆仓开着的时候，顺带把 MCP 的网址入口也开着，给只认网址的工具（比如 Grok Bot）用。只监听本机。
+    func stopMCPServer() {
+        guard let proc = mcpServerProcess else {
+            mcpServerRunning = false
+            return
+        }
+        mcpServerProcess = nil
+        mcpServerRunning = false
+        if proc.isRunning { proc.terminate() }
+        addLog("已关闭本机 MCP 网址入口")
+    }
+
+    /// 豆仓开着且用户开启开关时，才在 127.0.0.1 启动带令牌鉴权的 HTTP MCP 入口。
     func startMCPServer() {
+        stopMCPServer()
         guard FileManager.default.isExecutableFile(atPath: Self.cliPath) else { return }
+        let token = mcpToken(createIfMissing: true)
+        guard MCPHTTPPolicy.isValidTokenFormat(token) else { return }
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", #"parent=$1; shift; "$@" & child=$!; while kill -0 "$parent" 2>/dev/null && kill -0 "$child" 2>/dev/null; do sleep 1; done; kill "$child" 2>/dev/null"#,
-                       "beanpod-mcp", String(ProcessInfo.processInfo.processIdentifier), Self.cliPath, "serve", "--port", String(Self.mcpPort)]
+        p.executableURL = URL(fileURLWithPath: Self.cliPath)
+        p.arguments = ["serve", "--port", String(Self.mcpPort), "--parent-pid", String(ProcessInfo.processInfo.processIdentifier)]
+        var env = ProcessInfo.processInfo.environment
+        env["BEANPOD_MCP_TOKEN"] = token
+        p.environment = env
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        if (try? p.run()) != nil { addLog("MCP 网址入口：\(Self.mcpAddress)") }
+        p.terminationHandler = { [weak self] proc in
+            Task { @MainActor [weak self] in
+                if self?.mcpServerProcess === proc {
+                    self?.mcpServerProcess = nil
+                    self?.mcpServerRunning = false
+                }
+            }
+        }
+        do {
+            try p.run()
+            mcpServerProcess = p
+            mcpServerRunning = true
+            addLog("MCP 网址入口已启动：\(Self.mcpAddress)（已启用本机令牌鉴权）")
+        } catch {
+            addLog("MCP 网址入口没启动起来：\(error.localizedDescription)")
+        }
     }
     #endif
 

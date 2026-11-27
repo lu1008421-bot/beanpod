@@ -928,9 +928,11 @@ private struct VocabularyPane: View {
 // MARK: 连接
 
 private struct ConnectPane: View {
+    @Environment(BeanStore.self) private var store
     @Environment(\.openWindow) private var openWindow
     @Environment(Connector.self) private var connector
     @State private var copied = false
+    @State private var rotated = false
 
     var body: some View {
         PaneFrame {
@@ -946,13 +948,31 @@ private struct ConnectPane: View {
 
             LoginsGroup()
 
-            SettingsGroup(String(localized: "给其他工具用"), footer: String(localized: "这个地址只在这台电脑上能访问，而且只有豆仓开着的时候才通。")) {
-                SettingRow(icon: "network", title: String(localized: "接入地址")) {
-                    Text(BeanStore.mcpAddress).font(.callout.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                    Button(copied ? "已拷贝" : "拷贝") {
-                        copy(BeanStore.mcpAddress)
-                        copied = true
-                        Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
+            SettingsGroup(String(localized: "给其他工具用"), footer: String(localized: "命令行入口随时可用。网址入口默认关闭，仅监听 127.0.0.1 且需要令牌鉴权。")) {
+                SettingRow(icon: "network", title: String(localized: "本机网址入口（HTTP MCP）"),
+                           detail: String(localized: "仅给 Grok Bot 等只认网址的工具用，开启后需带令牌访问。")) {
+                    Toggle("本机网址入口（HTTP MCP）", isOn: Binding(
+                        get: { store.settings.httpMCPEnabled },
+                        set: { store.setHTTPMCPEnabled($0) }
+                    ))
+                    .labelsHidden().toggleStyle(.switch)
+                }
+                if store.settings.httpMCPEnabled {
+                    SettingRow(icon: "key", title: String(localized: "接入地址")) {
+                        Text(store.mcpMaskedAddress).font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        Button(copied ? "已拷贝" : "拷贝含令牌地址") {
+                            if let addr = store.mcpAuthenticatedAddress() {
+                                copy(addr)
+                                copied = true
+                                Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
+                            }
+                        }
+                        Button(rotated ? "已重置" : "重置令牌") {
+                            if store.rotateMCPToken() {
+                                rotated = true
+                                Task { try? await Task.sleep(for: .seconds(1.5)); rotated = false }
+                            }
+                        }
                     }
                 }
                 SettingRow(icon: "terminal", title: String(localized: "命令行"), detail: String(localized: "在终端里也能查录音、存内容。")) {
