@@ -236,7 +236,7 @@ extension BeanStore {
             if !s.vector.isEmpty {
                 let sample = VoiceSample(id: UUID(), personID: s.candidateID, sourceKind: .recordingSpan, recordingID: s.recordingID,
                                          startMs: s.startMs, endMs: s.endMs, managedFile: nil, channel: recordings[i].speakerChannel,
-                                         confirmed: true, modelVersion: SpeakerEngine.embeddingCAMPPName,
+                                         confirmed: true, modelVersion: Self.embeddingModelName,
                                          contentHash: "recording-\(s.recordingID)-\(s.localSpeaker)-\(s.startMs)")
                 try db.addSample(sample, embedding: s.vector)
             }
@@ -262,6 +262,15 @@ extension BeanStore {
             try db.deleteJob(id: s.id)
             peopleRevision += 1
         } catch { peopleError = error.localizedDescription }
+    }
+
+    /// 声纹向量模型的标识（人物库在 iOS 上也能读，但那边没有声纹引擎）。
+    nonisolated static var embeddingModelName: String {
+        #if os(macOS)
+        SpeakerEngine.embeddingCAMPPName
+        #else
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+        #endif
     }
 
     /// 编辑 / 移除一条人物资料（移除是软删，数据库里还留着）。
