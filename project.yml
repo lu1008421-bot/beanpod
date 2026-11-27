@@ -83,6 +83,8 @@ targets:
     platform: macOS
     sources:
       - App/SpeakerEngine.swift
+      # SpeakerEngine 分窗后靠它跨窗重连说话人
+      - Shared/SpeakerMatching.swift
       - tools/speaker-lab
     dependencies:
       - package: sherpa-onnx

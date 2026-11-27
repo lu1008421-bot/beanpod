@@ -119,9 +119,56 @@ actor SpeakerEngine {
         let d = ensureDiarizer(segmentation: segURL, embedding: embURL, numClusters: numClusters, threshold: threshold, numThreads: numThreads)
         guard let d else { return [] }
 
-        let raw = d.process(samples: samples)
-        let segments = raw.map { DiarizedSegment(start: Double($0.start), end: Double($0.end), speaker: $0.speaker) }
-        return Self.markOverlaps(segments)
+        let single = Self.markOverlaps(d.process(samples: samples).map { DiarizedSegment(start: Double($0.start), end: Double($0.end), speaker: $0.speaker) })
+        // 长录音：分窗推理，内存只跟窗口大小有关，不跟整条录音走
+        if samples.count > Int(Self.windowSeconds * 16000) + 1600 { return diarizeWindowed(samples: samples, diarizer: d) }
+        return single
+    }
+
+    /// 分窗参数：每窗 5 分钟，相邻窗重叠 30 秒。
+    nonisolated static let windowSeconds: Double = 300
+    nonisolated static let windowOverlap: Double = 30
+
+    nonisolated static func windows(sampleCount: Int, rate: Int = 16000) -> [Range<Int>] {
+        let window = Int(windowSeconds * Double(rate)), step = window - Int(windowOverlap * Double(rate))
+        var out: [Range<Int>] = []
+        var start = 0
+        while start < sampleCount {
+            let end = min(sampleCount, start + window)
+            out.append(start..<end)
+            if end >= sampleCount { break }
+            start += step
+        }
+        return out
+    }
+
+    /// 分窗做说话人分割，再用各窗里每个说话人的声纹中心把同一个人跨窗连起来（见 `WindowLinker`）。
+    /// 每个窗只保留「中点不落在与上一窗重叠区」的区间，边界上的话只算一次。
+    private func diarizeWindowed(samples: [Float], diarizer d: SherpaOnnxOfflineSpeakerDiarizationWrapper) -> [DiarizedSegment] {
+        let rate = 16000
+        var windows: [WindowLinker.Window] = []
+        for (n, r) in Self.windows(sampleCount: samples.count).enumerated() {
+            let t0 = Double(r.lowerBound) / Double(rate)
+            let local = d.process(samples: Array(samples[r])).map {
+                DiarizedSegment(start: t0 + Double($0.start), end: t0 + Double($0.end), speaker: $0.speaker)
+            }
+            // 每个本地说话人：向量求和后取中心
+            var sums: [Int: [Float]] = [:], counts: [Int: Int] = [:]
+            for e in embeddings(for: samples, segments: local) {
+                var s = sums[e.speaker] ?? [Float](repeating: 0, count: e.vector.count)
+                for i in 0..<min(s.count, e.vector.count) { s[i] += e.vector[i] }
+                sums[e.speaker] = s; counts[e.speaker, default: 0] += 1
+            }
+            var centroids: [Int: [Float]] = [:]
+            for (spk, s) in sums {
+                let len = s.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+                if len > 0 { centroids[spk] = s.map { $0 / len } }
+            }
+            windows.append(WindowLinker.Window(turns: local.map { WindowLinker.Turn(start: $0.start, end: $0.end, speaker: $0.speaker) },
+                                               centroids: centroids, keepFrom: n == 0 ? 0 : t0 + Self.windowOverlap))
+        }
+        let linked = WindowLinker.merge(windows) { Self.cosine($0, $1) }
+        return Self.markOverlaps(linked.map { DiarizedSegment(start: $0.start, end: $0.end, speaker: $0.speaker) })
     }
 
     private func ensureDiarizer(segmentation: URL, embedding: URL, numClusters: Int, threshold: Float, numThreads: Int) -> SherpaOnnxOfflineSpeakerDiarizationWrapper? {

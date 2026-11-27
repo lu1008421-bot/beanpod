@@ -54,6 +54,10 @@ struct SpeakerLab {
             print(String(format: "  [%7.2f - %7.2f] speaker_%d overlap=%@", s.start, s.end, s.speaker, s.overlap ? "true" : "false"))
         }
         print(String(format: "embeddings: %d in %.2fs  RTF=%.3f", embeddings.count, embedTime, rtfEmb))
+        // 峰值常驻内存（macOS 的 ru_maxrss 单位是字节）
+        var ru = rusage()
+        getrusage(RUSAGE_SELF, &ru)
+        print(String(format: "peak_rss_mb=%.1f", Double(ru.ru_maxrss) / 1_048_576))
         for e in embeddings {
             print(String(format: "  emb speaker_%d [%7.2f-%7.2f] dim=%d", e.speaker, e.start, e.end, e.vector.count))
         }

@@ -220,6 +220,16 @@ nonisolated final class PeopleDB {
         else { sqlite3_bind_null(stmt, i) }
     }
 
+    /// 预处理一条语句，把参数依次绑到 `?` 上。所有带值的查询都走这里，不拼字符串。
+    /// 调用方负责 `sqlite3_finalize`。
+    private func prepare(_ sql: String, _ args: [String?] = []) throws -> OpaquePointer {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        for (i, a) in args.enumerated() { bind(stmt, Int32(i + 1), a) }
+        return stmt
+    }
+
     // MARK: - 人物
 
     /// 取下一个不回收的陌生人编号（0→A）。计数器存 meta，跨重启稳定。
@@ -263,12 +273,14 @@ nonisolated final class PeopleDB {
     }
 
     func listPersons(status: PersonStatus? = nil) throws -> [Person] {
-        let whereSQL = status.map { " WHERE status='\($0.rawValue)'" } ?? ""
-        return try queryPersons("SELECT id,display_name,stranger_index,color_index,status,is_me,note,created_at,last_met_at FROM persons\(whereSQL) ORDER BY stranger_index;")
+        let whereSQL = status == nil ? "" : " WHERE status=?"
+        return try queryPersons("SELECT id,display_name,stranger_index,color_index,status,is_me,note,created_at,last_met_at FROM persons\(whereSQL) ORDER BY stranger_index;",
+                                args: [status?.rawValue])
     }
 
     func person(id: UUID) throws -> Person? {
-        try queryPersons("SELECT id,display_name,stranger_index,color_index,status,is_me,note,created_at,last_met_at FROM persons WHERE id='\(id.uuidString)';").first
+        try queryPersons("SELECT id,display_name,stranger_index,color_index,status,is_me,note,created_at,last_met_at FROM persons WHERE id=?;",
+                         args: [id.uuidString]).first
     }
 
     func renamePerson(id: UUID, to name: String) throws {
@@ -316,10 +328,8 @@ nonisolated final class PeopleDB {
         }
     }
 
-    private func queryPersons(_ sql: String) throws -> [Person] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    private func queryPersons(_ sql: String, args: [String?] = []) throws -> [Person] {
+        let stmt = try prepare(sql, args)
         defer { sqlite3_finalize(stmt) }
         var out: [Person] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -350,11 +360,11 @@ nonisolated final class PeopleDB {
 
     // MARK: - 声音样本
 
-    func addSample(_ s: VoiceSample, embedding: [Float]?) throws {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "INSERT INTO voice_samples(id,person_id,source_kind,recording_id,start_ms,end_ms,managed_file,channel,confirmed,model_version,embedding,content_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?);"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    /// 存一段声音样本。同一个人已有相同内容（`contentHash` 相同）的样本时不再入库，返回 false。
+    @discardableResult
+    func addSample(_ s: VoiceSample, embedding: [Float]?) throws -> Bool {
+        if !s.contentHash.isEmpty, try sampleExists(personID: s.personID, contentHash: s.contentHash) { return false }
+        let stmt = try prepare("INSERT INTO voice_samples(id,person_id,source_kind,recording_id,start_ms,end_ms,managed_file,channel,confirmed,model_version,embedding,content_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?);")
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, s.id.uuidString)
         bind(stmt, 2, s.personID.uuidString)
@@ -373,14 +383,23 @@ nonisolated final class PeopleDB {
             sqlite3_bind_null(stmt, 11)
         }
         bind(stmt, 12, s.contentHash)
-        guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        guard let db, sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql("insert sample") }
+        return true
+    }
+
+    func sampleExists(personID: UUID, contentHash: String) throws -> Bool {
+        let stmt = try prepare("SELECT 1 FROM voice_samples WHERE person_id=? AND content_hash=? LIMIT 1;", [personID.uuidString, contentHash])
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    /// 把一个人的全部样本标为已确认（用户认下了这个人，TA 名下的声音就可以当标准声纹用）。
+    func confirmSamples(personID: UUID) throws {
+        try update("UPDATE voice_samples SET confirmed=1 WHERE person_id=?;", args: [personID.uuidString])
     }
 
     func listSamples(personID: UUID) throws -> [VoiceSample] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT id,person_id,source_kind,recording_id,start_ms,end_ms,managed_file,channel,confirmed,model_version,content_hash FROM voice_samples WHERE person_id='\(personID.uuidString)' ORDER BY start_ms;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT id,person_id,source_kind,recording_id,start_ms,end_ms,managed_file,channel,confirmed,model_version,content_hash FROM voice_samples WHERE person_id=? ORDER BY start_ms;", [personID.uuidString])
         defer { sqlite3_finalize(stmt) }
         var out: [VoiceSample] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -406,10 +425,7 @@ nonisolated final class PeopleDB {
 
     /// 读出一个人的全部声纹向量（含未确认样本；是否只用 confirmed 由上层决定）。
     func embeddings(personID: UUID) throws -> [[Float]] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT embedding FROM voice_samples WHERE person_id='\(personID.uuidString)' AND embedding IS NOT NULL ORDER BY confirmed DESC, start_ms;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT embedding FROM voice_samples WHERE person_id=? AND embedding IS NOT NULL ORDER BY confirmed DESC, start_ms;", [personID.uuidString])
         defer { sqlite3_finalize(stmt) }
         var out: [[Float]] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -424,10 +440,7 @@ nonisolated final class PeopleDB {
 
     /// 已人工确认样本的声纹向量（用于标准声纹均值）。
     func confirmedEmbeddings(personID: UUID) throws -> [[Float]] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT embedding FROM voice_samples WHERE person_id='\(personID.uuidString)' AND confirmed=1 AND embedding IS NOT NULL ORDER BY start_ms;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT embedding FROM voice_samples WHERE person_id=? AND confirmed=1 AND embedding IS NOT NULL ORDER BY start_ms;", [personID.uuidString])
         defer { sqlite3_finalize(stmt) }
         var out: [[Float]] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -510,10 +523,7 @@ nonisolated final class PeopleDB {
     }
 
     func listUtterances(recordingID: UInt32) throws -> [Utterance] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT id,recording_id,audio_fingerprint,start_ms,end_ms,local_speaker,overlap,person_id,source,score,model_version FROM utterances WHERE recording_id=\(recordingID) ORDER BY start_ms;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT id,recording_id,audio_fingerprint,start_ms,end_ms,local_speaker,overlap,person_id,source,score,model_version FROM utterances WHERE recording_id=? ORDER BY start_ms;", [String(recordingID)])
         defer { sqlite3_finalize(stmt) }
         var out: [Utterance] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -578,10 +588,7 @@ nonisolated final class PeopleDB {
     }
 
     func listInsights(personID: UUID) throws -> [PersonInsight] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT id,person_id,kind,text,recording_id,start_ms,end_ms,occurred_at,edited_by_user,model_version,stale FROM person_insights WHERE person_id='\(personID.uuidString)' ORDER BY occurred_at IS NULL, occurred_at DESC, id;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT id,person_id,kind,text,recording_id,start_ms,end_ms,occurred_at,edited_by_user,model_version,stale FROM person_insights WHERE person_id=? ORDER BY occurred_at IS NULL, occurred_at DESC, id;", [personID.uuidString])
         defer { sqlite3_finalize(stmt) }
         var out: [PersonInsight] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -627,10 +634,7 @@ nonisolated final class PeopleDB {
 
     /// 某个人物名下的全部发言归属（按录音、时间排序）。
     func listUtterancesForPerson(personID: UUID) throws -> [Utterance] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT id,recording_id,audio_fingerprint,start_ms,end_ms,local_speaker,overlap,person_id,source,score,model_version FROM utterances WHERE person_id='\(personID.uuidString)' ORDER BY recording_id, start_ms;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT id,recording_id,audio_fingerprint,start_ms,end_ms,local_speaker,overlap,person_id,source,score,model_version FROM utterances WHERE person_id=? ORDER BY recording_id, start_ms;", [personID.uuidString])
         defer { sqlite3_finalize(stmt) }
         var out: [Utterance] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -677,10 +681,8 @@ nonisolated final class PeopleDB {
         var insights: [UUID]
     }
 
-    private func personIDs(_ sql: String) throws -> [UUID] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    private func personIDs(_ sql: String, _ args: [String?] = []) throws -> [UUID] {
+        let stmt = try prepare(sql, args)
         defer { sqlite3_finalize(stmt) }
         var out: [UUID] = []
         while sqlite3_step(stmt) == SQLITE_ROW { if let u = UUID(uuidString: text(stmt, 0)) { out.append(u) } }
@@ -701,10 +703,7 @@ nonisolated final class PeopleDB {
     }
 
     private func jobPayload(id: String) throws -> String? {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT payload FROM jobs_and_audits WHERE id='\(id)';"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT payload FROM jobs_and_audits WHERE id=?;", [id])
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return sqlite3_column_type(stmt, 0) == SQLITE_NULL ? nil : text(stmt, 0)
@@ -733,9 +732,9 @@ nonisolated final class PeopleDB {
     func mergePersons(primary: UUID, secondary: UUID) throws -> String {
         guard primary != secondary else { throw Error.sql("不能合并同一个人") }
         guard let sec = try person(id: secondary) else { throw Error.sql("要合并的人物不存在") }
-        let samples = try personIDs("SELECT id FROM voice_samples WHERE person_id='\(secondary.uuidString)';")
-        let utterances = try personIDs("SELECT id FROM utterances WHERE person_id='\(secondary.uuidString)';")
-        let insights = try personIDs("SELECT id FROM person_insights WHERE person_id='\(secondary.uuidString)';")
+        let samples = try personIDs("SELECT id FROM voice_samples WHERE person_id=?;", [secondary.uuidString])
+        let utterances = try personIDs("SELECT id FROM utterances WHERE person_id=?;", [secondary.uuidString])
+        let insights = try personIDs("SELECT id FROM person_insights WHERE person_id=?;", [secondary.uuidString])
         let logID = UUID().uuidString
         let snap = MergeSnapshot(
             primary: primary, secondary: secondary,
@@ -814,14 +813,34 @@ nonisolated final class PeopleDB {
     }
 
     func rejectedPairs() throws -> [String] {
-        guard let db else { throw Error.openFailed("not open") }
-        var stmt: OpaquePointer?
-        let sql = "SELECT payload FROM jobs_and_audits WHERE kind='rejected_pair' AND payload IS NOT NULL ORDER BY created_at;"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        let stmt = try prepare("SELECT payload FROM jobs_and_audits WHERE kind=? AND payload IS NOT NULL ORDER BY created_at;", ["rejected_pair"])
         defer { sqlite3_finalize(stmt) }
         var out: [String] = []
         while sqlite3_step(stmt) == SQLITE_ROW { out.append(text(stmt, 0)) }
         return out
+    }
+
+    /// 还没处理的「建议确认」：某个新声音像某位已有人物，等人点一下。
+    func listSuggestions() throws -> [SpeakerSuggestion] {
+        let stmt = try prepare("SELECT id,payload FROM jobs_and_audits WHERE kind=? ORDER BY created_at;", ["speaker_suggestion"])
+        defer { sqlite3_finalize(stmt) }
+        var out: [SpeakerSuggestion] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if var s = SpeakerSuggestion.parse(text(stmt, 1)) { s.id = text(stmt, 0); out.append(s) }
+        }
+        return out
+    }
+
+    func deleteJob(id: String) throws {
+        try update("DELETE FROM jobs_and_audits WHERE id=?;", args: [id])
+    }
+
+    /// 取出某个人的受管样本文件名（删样本时顺带删磁盘文件用）。
+    func sampleFile(id: UUID) throws -> String? {
+        let stmt = try prepare("SELECT managed_file FROM voice_samples WHERE id=?;", [id.uuidString])
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
+        return text(stmt, 0)
     }
 
     // MARK: - 浮点向量 <-> BLOB

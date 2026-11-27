@@ -393,6 +393,10 @@ nonisolated struct Recording: Identifiable, Equatable, Codable {
     var todos: [Todo] = []
     var tags: [String] = []
     var people: [String] = []
+    /// `people` 里由声纹认出来的那几位。重新整理时只换掉这部分，保留模型从内容里提到的其它人名。
+    var voicePeople: [String] = []
+    /// 用户把这条录音排除出「人物」：不认人、不建卡，人物页也不显示它的发言和资料。
+    var peopleExcluded = false
     var analyzedBy: String?
     var starred = false
     /// 不是从录音豆来的：外部导入的音频，或者只有文字的笔记。
@@ -499,7 +503,7 @@ nonisolated struct Recording: Identifiable, Equatable, Codable {
 
     private enum CodingKeys: String, CodingKey {
         case id, size, date, duration, title, titleEdited, tagsEdited, downloaded, onDevice, transcript, segments, transcribedBy, speakers, rewrites
-        case scene, sceneLocked, summary, sections, todos, tags, people, analyzedBy, starred, origin, source, project, translation, textOnly, marks, videos, typedInto, studyMode, study
+        case scene, sceneLocked, summary, sections, todos, tags, people, voicePeople, peopleExcluded, analyzedBy, starred, origin, source, project, translation, textOnly, marks, videos, typedInto, studyMode, study
     }
 
     /// 每个字段都容错读取：以后加字段，旧的记录文件照样能打开。
@@ -526,6 +530,8 @@ nonisolated struct Recording: Identifiable, Equatable, Codable {
         todos = (try? c.decodeIfPresent([Todo].self, forKey: .todos)) ?? []
         tags = (try? c.decodeIfPresent([String].self, forKey: .tags)) ?? []
         people = (try? c.decodeIfPresent([String].self, forKey: .people)) ?? []
+        voicePeople = (try? c.decodeIfPresent([String].self, forKey: .voicePeople)) ?? []
+        peopleExcluded = (try? c.decodeIfPresent(Bool.self, forKey: .peopleExcluded)) ?? false
         analyzedBy = try c.decodeIfPresent(String.self, forKey: .analyzedBy)
         starred = try c.decodeIfPresent(Bool.self, forKey: .starred) ?? false
         origin = try c.decodeIfPresent(String.self, forKey: .origin)
