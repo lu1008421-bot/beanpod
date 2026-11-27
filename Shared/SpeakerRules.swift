@@ -63,8 +63,9 @@ nonisolated struct SpanPlayback: Equatable, Sendable {
     }
 
     /// 播放头跳到了正在听的这一段之外：这段算听完了，停点也一起作废。
+    /// 首尾各留 0.25 秒容差：AVAudioPlayer 的 currentTime 会因帧对齐略小于句首，别在第一帧就误清。
     mutating func leaveIfOutside(at time: TimeInterval) {
-        if let s = activeSpan, !s.contains(time) { clear() }
+        if let s = activeSpan, time < s.lowerBound - 0.25 || time > s.upperBound + 0.25 { clear() }
     }
 
     mutating func clear() {

@@ -1102,7 +1102,9 @@ final class BeanStore {
 
     func togglePlay(_ id: UInt32) {
         if playingID == id, let player {
-            if player.isPlaying { player.pause(); isPlaying = false } else { player.play(); isPlaying = true; tick() }
+            if player.isPlaying {
+                player.pause(); isPlaying = false; spanPlayback.clear()   // 暂停后界面别再显示「停」
+            } else { player.play(); isPlaying = true; tick() }
             return
         }
         stop()

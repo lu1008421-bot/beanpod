@@ -1510,7 +1510,7 @@ struct RecordingDetail: View {
                     .padding(.horizontal, 10).padding(.vertical, 5)
                     .background(Theme.warm100, in: .rect(cornerRadius: Theme.Radius.card))
             }
-            .buttonStyle(.plain).keyboardShortcut(.leftArrow, modifiers: .command).help("返回人物（⌘←）")
+            .buttonStyle(.plain).keyboardShortcut("[", modifiers: [.command, .option]).help("返回人物（⌘⌥[）")
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 24).padding(.top, 12)
         }

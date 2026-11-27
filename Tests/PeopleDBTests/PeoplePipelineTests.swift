@@ -241,9 +241,19 @@ final class PeoplePipelineTests: XCTestCase {
     func testSpanPlaybackTracksActiveSpan() {
         var p = SpanPlayback()
         XCTAssertNil(p.activeSpan)
-        p.begin(10...20, loop: false, duration: 100)
+        p.begin(10...20, loop: false, duration:100)
         XCTAssertEqual(p.activeSpan, 10...20)
         XCTAssertEqual(p.stopAt, 20, "不循环：播到句尾停")
+        p.leaveIfOutside(at: 9.99)
+        XCTAssertEqual(p.activeSpan, 10...20, "首帧比句首略小（帧对齐）不能误清")
+        XCTAssertEqual(p.stopAt, 20)
+        p.leaveIfOutside(at: 20.1)
+        XCTAssertEqual(p.activeSpan, 10...20, "句尾略过一点也不误清")
+        p.leaveIfOutside(at: 8.0)
+        XCTAssertNil(p.activeSpan, "确实跳到段外才清")
+        XCTAssertNil(p.stopAt)
+
+        p.begin(10...20, loop: false, duration: 100)
         p.clear()                                   // stop()
         XCTAssertNil(p.activeSpan)
         XCTAssertNil(p.stopAt)
@@ -253,7 +263,7 @@ final class PeoplePipelineTests: XCTestCase {
         XCTAssertNil(p.stopAt)
         p.leaveIfOutside(at: 15)
         XCTAssertEqual(p.activeSpan, 10...20, "还在这一段里：不变")
-        p.leaveIfOutside(at: 30)                    // play(_:at:) 跳出去了
+        p.leaveIfOutside(at: 30)
         XCTAssertNil(p.activeSpan)
         XCTAssertNil(p.stopAt)
 

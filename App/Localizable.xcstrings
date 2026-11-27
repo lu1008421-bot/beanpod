@@ -16534,12 +16534,12 @@
         }
       }
     },
-  "返回人物（⌘←）": {
+  "返回人物（⌘⌥[）": {
     "localizations": {
       "en": {
         "stringUnit": {
           "state": "translated",
-          "value": "Back to person (⌘←)"
+          "value": "Back to person (⌘⌥[)"
         }
       }
     }
