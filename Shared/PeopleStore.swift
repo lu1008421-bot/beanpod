@@ -231,7 +231,8 @@ extension BeanStore {
     func acceptSuggestion(_ s: SpeakerSuggestion) {
         guard let db = peopleDB, let i = recordings.firstIndex(where: { $0.id == s.recordingID }) else { return }
         do {
-            try db.assignUtterancesByLocalSpeaker(recordingID: s.recordingID, localSpeaker: s.localSpeaker, personID: s.candidateID)
+            // 发言全部归到 TA；这个声音自己的待认识卡并掉（只删这一张，别人的不动）
+            try db.acceptSuggestion(recordingID: s.recordingID, localSpeaker: s.localSpeaker, candidateID: s.candidateID)
             // 用户认下了这段声音：它的中心声纹存成这个人的已确认样本
             if !s.vector.isEmpty {
                 let sample = VoiceSample(id: UUID(), personID: s.candidateID, sourceKind: .recordingSpan, recordingID: s.recordingID,
@@ -242,12 +243,6 @@ extension BeanStore {
             }
             try db.setLastMet(id: s.candidateID, recordings[i].date)
             try db.deleteJob(id: s.id)
-            // 这个声音如果已经另建了待认识卡，一并并掉
-            for other in people where other.status == .pending {
-                if samples(personID: other.id).contains(where: { $0.recordingID == s.recordingID && $0.startMs < s.endMs && $0.endMs > s.startMs }) {
-                    try db.deletePersonCascade(id: other.id)
-                }
-            }
             reloadPeople()
             syncPeopleToLibrary([s.recordingID])
             peopleRevision += 1

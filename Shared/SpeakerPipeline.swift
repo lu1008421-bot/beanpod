@@ -27,18 +27,6 @@ extension Recording {
 
 // MARK: - 先分人后转写流水线
 
-#if os(macOS)
-/// 一段尚未自动建卡、等待场景确认后再决定是否升格的新声音（仅存中心向量与代表区间，不常驻音频）。
-nonisolated struct StrangerCandidate: Sendable {
-    var localSpeaker: Int
-    var centroid: [Float]
-    var seconds: Double
-    var startMs: Int
-    var endMs: Int
-    var channel: VoiceChannel
-}
-#endif
-
 extension BeanStore {
     /// 把一条录音里出现的本地说话人编号补进 `Recording.speakers`（默认「说话人 N」标签）。
     func syncLocalSpeakers(_ id: UInt32, from segments: [Segment]) {
@@ -121,6 +109,7 @@ extension BeanStore {
     func alignTranscriptWithSpeakers(_ id: UInt32, segments: inout [Segment]) async {
         guard let i = recordings.firstIndex(where: { $0.id == id }), speakerPathApplies(recordings[i]), !segments.isEmpty,
               let samples = try? SpeakerEngine.loadMono16k(wavURL(id)) else { return }
+        let duration = recordings[i].duration
         let diar = await SpeakerEngine.shared.diarize(samples: samples)
         guard !diar.isEmpty else { return }
         await attributeSpeakers(id, samples: samples, diar: diar)
@@ -129,10 +118,22 @@ extension BeanStore {
         let whole = segments.count == 1 && segments[0].start == 0
         guard !whole else { return }
         let runs = Self.speakerRuns(diar).map { (span: SpeakerAlignment.Span(start: Double($0.start) / 16000, end: Double($0.end) / 16000), speaker: $0.speaker) }
-        let speakers = SpeakerAlignment.segmentSpeakers(
-            segments: segments.map { SpeakerAlignment.Span(start: $0.start, end: $0.end ?? $0.start) }, runs: runs)
+        // 老文字稿的句子只有开头时间：句尾用下一句的开头，最后一句用到录音结束
+        let spans = SpeakerAlignment.withEnds(segments.map { (start: $0.start, end: $0.end) }, duration: duration)
+        let speakers = SpeakerAlignment.segmentSpeakers(segments: spans, runs: runs)
         for n in segments.indices where speakers[n] != nil { segments[n].speaker = speakers[n] }
         applyManualAttribution(id, to: &segments)
+    }
+
+    /// 升级前就转写好的存量录音（没走过声纹）：本地有 WAV、人物库里还没有它的发言记录时，补一次分人对齐。
+    func backfillSpeakers(_ id: UInt32) async {
+        guard let i = recordings.firstIndex(where: { $0.id == id }) else { return }
+        var segments = recordings[i].segments
+        await alignTranscriptWithSpeakers(id, segments: &segments)
+        guard !segments.isEmpty else { return }
+        recordings[i].segments = segments
+        syncLocalSpeakers(id, from: segments)
+        saveLibrary()
     }
 
     /// 分人后提取声纹、与人物库比对，并把区间写进发言表。
@@ -176,27 +177,27 @@ extension BeanStore {
                 if let pid = res.personID { try? db.setLastMet(id: pid, rec.date) }
             case .suggest:
                 // 像某位已有人物但分数不够：记一条「建议确认」，人物页给出「就是 TA / 不是」
-                if let top = res.topCandidateID, let cand = stranger(spk, embs, centroid, channel) {
+                if let top = res.topCandidateID, let cand = stranger(spk, embs, channel), let clip = cand.longestClip {
+                    // 回听入口给最长的那一段
                     try? db.recordJob(kind: "speaker_suggestion",
                                       payload: SpeakerSuggestion(id: "", recordingID: id, localSpeaker: spk, candidateID: top, score: res.score,
-                                                                 vector: centroid, startMs: cand.startMs, endMs: cand.endMs).payload)
+                                                                 vector: centroid, startMs: clip.startMs, endMs: clip.endMs).payload)
                     strangers.append(cand)
                 }
             case .newPerson:
-                if let c = stranger(spk, embs, centroid, channel) { strangers.append(c) }
+                if let c = stranger(spk, embs, channel) { strangers.append(c) }
             }
         }
         pendingStrangerCandidates[id] = strangers
         return results
     }
 
-    private func stranger(_ spk: Int, _ embs: [SpeakerEngine.Embedding], _ centroid: [Float], _ channel: VoiceChannel) -> StrangerCandidate? {
+    private func stranger(_ spk: Int, _ embs: [SpeakerEngine.Embedding], _ channel: VoiceChannel) -> StrangerCandidate? {
         let sec = embs.map(\.duration).reduce(0, +)
         guard sec > 0 else { return nil }
-        return StrangerCandidate(localSpeaker: spk, centroid: centroid,
-                          seconds: sec,
-                          startMs: embs.map { Int($0.start * 1000) }.min() ?? 0,
-                          endMs: embs.map { Int($0.end * 1000) }.max() ?? 0, channel: channel)
+        return StrangerCandidate(localSpeaker: spk, seconds: sec,
+                                 clips: StrangerClips.representative(embs.map { (start: $0.start, end: $0.end, vector: $0.vector) }),
+                                 channel: channel)
     }
 
     /// 场景确定后调用：对达标（≥ 30 秒清晰发言）、场景允许的近场声音建待认识卡并记代表样本。
@@ -208,11 +209,14 @@ extension BeanStore {
         for c in candidates where c.seconds >= SpeakerMatcher.minStrangerSeconds {
             do {
                 let person = try db.createPerson(displayName: "", status: .pending)
-                let sample = VoiceSample(id: UUID(), personID: person.id, sourceKind: .recordingSpan, recordingID: id,
-                                         startMs: c.startMs, endMs: c.endMs, managedFile: nil, channel: c.channel,
-                                         confirmed: false, modelVersion: SpeakerEngine.embeddingCAMPPName,
-                                         contentHash: "recording-\(id)-\(c.startMs)-\(c.endMs)")
-                try db.addSample(sample, embedding: c.centroid)
+                // 代表原声逐段入库：每段是这句录音里连续的一句话，试听时听到的就是这一个人的声音
+                for (n, clip) in c.clips.enumerated() {
+                    let sample = VoiceSample(id: UUID(), personID: person.id, sourceKind: .recordingSpan, recordingID: id,
+                                             startMs: clip.startMs, endMs: clip.endMs, managedFile: nil, channel: c.channel,
+                                             confirmed: false, modelVersion: Self.embeddingModelName,
+                                             contentHash: "recording-\(id)-\(c.localSpeaker)-\(n)-\(clip.startMs)")
+                    try db.addSample(sample, embedding: clip.vector)
+                }
                 try db.assignUtterancesByLocalSpeaker(recordingID: id, localSpeaker: c.localSpeaker, personID: person.id)
                 try db.setLastMet(id: person.id, rec.date)
             } catch { peopleError = error.localizedDescription }

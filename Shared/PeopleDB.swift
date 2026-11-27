@@ -320,12 +320,15 @@ nonisolated final class PeopleDB {
 
     /// 删除人物卡并级联清掉其声音样本、发言归属与资料。
     func deletePersonCascade(id: UUID) throws {
-        try transaction {
-            try update("DELETE FROM voice_samples WHERE person_id=?;", args: [id.uuidString])
-            try update("DELETE FROM utterances WHERE person_id=?;", args: [id.uuidString])
-            try update("DELETE FROM person_insights WHERE person_id=?;", args: [id.uuidString])
-            try update("DELETE FROM persons WHERE id=?;", args: [id.uuidString])
-        }
+        try transaction { try cascadeDelete(id: id) }
+    }
+
+    /// 级联删除的几条语句本身（给已经在事务里的调用方用）。
+    private func cascadeDelete(id: UUID) throws {
+        try update("DELETE FROM voice_samples WHERE person_id=?;", args: [id.uuidString])
+        try update("DELETE FROM utterances WHERE person_id=?;", args: [id.uuidString])
+        try update("DELETE FROM person_insights WHERE person_id=?;", args: [id.uuidString])
+        try update("DELETE FROM persons WHERE id=?;", args: [id.uuidString])
     }
 
     private func queryPersons(_ sql: String, args: [String?] = []) throws -> [Person] {
@@ -520,6 +523,32 @@ nonisolated final class PeopleDB {
         sqlite3_bind_int64(stmt, 2, Int64(recordingID))
         sqlite3_bind_int64(stmt, 3, Int64(localSpeaker))
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    }
+
+    /// 采纳「疑似某人」在库里的部分：这个声音在这条录音里的发言全部改归 `candidateID`，
+    /// 它自己那张待认识卡并掉。只删这一张（按录音 + 本地说话人查），同一条录音里别的待认识卡不动。
+    func acceptSuggestion(recordingID: UInt32, localSpeaker: Int, candidateID: UUID) throws {
+        try transaction {
+            // 先记下它自己的待认识卡：发言一改归属就查不到了
+            let own = try pendingPersonID(recordingID: recordingID, localSpeaker: localSpeaker)
+            if let own {
+                // 发言先从待认识卡名下转过去；直接删卡会把发言一起删掉
+                try update("UPDATE utterances SET person_id=? WHERE recording_id=? AND local_speaker=? AND person_id=?;",
+                           args: [candidateID.uuidString, String(recordingID), String(localSpeaker), own.uuidString])
+            }
+            try assignUtterancesByLocalSpeaker(recordingID: recordingID, localSpeaker: localSpeaker, personID: candidateID)
+            if let own { try cascadeDelete(id: own) }
+        }
+    }
+
+    /// 某条录音里某个本地说话人现在关联的待认识人物；不是待认识卡（或没归属）就返回 nil。
+    func pendingPersonID(recordingID: UInt32, localSpeaker: Int) throws -> UUID? {
+        let stmt = try prepare("SELECT u.person_id FROM utterances u JOIN persons p ON p.id = u.person_id "
+                               + "WHERE u.recording_id = ? AND u.local_speaker = ? AND p.status = ? LIMIT 1;",
+                               [String(recordingID), String(localSpeaker), PersonStatus.pending.rawValue])
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return UUID(uuidString: text(stmt, 0))
     }
 
     func listUtterances(recordingID: UInt32) throws -> [Utterance] {

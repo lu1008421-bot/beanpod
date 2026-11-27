@@ -135,6 +135,11 @@ extension BeanStore {
 
     private func index(_ id: UInt32) -> Int? { recordings.firstIndex { $0.id == id } }
 
+    /// 文字稿里出现过几位说话人（没分过人就是 0）。
+    nonisolated static func localSpeakerCount(_ segments: [Segment]) -> Int {
+        Set(segments.compactMap(\.speaker)).count
+    }
+
     /// 跑完一条录音后统一收尾：场景已定，新声音该建卡的建卡，再把人物身份投影回录音库。
     /// 放在这里而不是各分支里，是为了整理失败、场景拦截建卡这些提前返回的情况也不会漏掉投影。
     private func run(_ id: UInt32) async {
@@ -155,6 +160,8 @@ extension BeanStore {
 
     private func runBody(_ id: UInt32) async {
         guard let rec = recordings.first(where: { $0.id == id }) else { return }
+        // 这次进来前就已经有文字稿、也不是来重转写的：属于「升级前转写好的存量录音」
+        let alreadyTranscribed = !(rec.transcript ?? "").isEmpty && !retranscribing.contains(id)
 
         // 1. 转写
         if (rec.transcript ?? "").isEmpty || retranscribing.contains(id) {
@@ -212,7 +219,7 @@ extension BeanStore {
                 recordings[i].segments = fresh
                 recordings[i].transcript = recordings[i].segments.map(\.text).joined(separator: "\n")
                 recordings[i].transcribedBy = engine
-                syncLocalSpeakers(id, from: segments)
+                syncLocalSpeakers(id, from: fresh)
                 saveLibrary()
             } catch {
                 let kept = !(rec.transcript ?? "").isEmpty
@@ -222,6 +229,16 @@ extension BeanStore {
                 return
             }
         }
+
+        #if os(macOS)
+        // 升级前转写好的存量录音没走过声纹：本地有 WAV、这次该认人、人物库里还没有它的发言记录，补一次分人对齐
+        if alreadyTranscribed, !rec.segments.isEmpty, speakerPathApplies(rec),
+           ((try? peopleDB?.listUtterances(recordingID: id)) ?? []).isEmpty {
+            stages[id] = .transcribing(0)
+            await backfillSpeakers(id)
+            stages[id] = nil
+        }
+        #endif
 
         // 2. 整理
         guard let i = index(id), let spoken = recordings[i].transcript else { return }
@@ -250,10 +267,12 @@ extension BeanStore {
                 }
             } catch {
                 problem = Problem(title: String(localized: "「\(rec.displayTitle)」没出完整纪要"), detail: String(localized: "分析模型这次没接通，先按关键词粗略分了类。\n原因：\(error.localizedDescription)\n检查一下设置里的分析模型，然后在这条录音上点「重新整理纪要」。"), action: .settings)
-                result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed)
+                result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed,
+                                         localSpeakers: Self.localSpeakerCount(recordings[i].segments))
             }
         } else {
-            result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed)
+            result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed,
+                                     localSpeakers: Self.localSpeakerCount(recordings[i].segments))
         }
         guard let j = index(id) else { return }
         // 已经有模型出的纪要，这次模型没接通只能按关键词粗分：别用粗分把好的纪要、待办盖掉
