@@ -270,12 +270,37 @@ final class BeanStore {
     /// 给 README 截图用，不碰真实录音（示例库由 scripts/make-demo-library.py 生成）。
     nonisolated static let demo = CommandLine.arguments.contains("-demo")
 
+    /// 隔离数据根目录：启动参数 `-data-dir <绝对路径>`（优先）或环境变量 `BEANPOD_DATA_DIR`。
+    /// 测试与自动化验收完全写入该目录（Recordings/、People/ 等都在其下），不碰正式库。优先级高于 `-demo`。
+    nonisolated static let dataDir: URL? = {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "-data-dir"), i + 1 < args.count, !args[i + 1].isEmpty {
+            return URL(fileURLWithPath: args[i + 1], isDirectory: true)
+        }
+        if let env = ProcessInfo.processInfo.environment["BEANPOD_DATA_DIR"], !env.isEmpty {
+            return URL(fileURLWithPath: env, isDirectory: true)
+        }
+        return nil
+    }()
+
     let folder: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent(BeanStore.demo ? "BeanPod/Demo/Recordings" : "BeanPod/Recordings", isDirectory: true)
+        let dir: URL
+        if let dataDir = BeanStore.dataDir {
+            dir = dataDir.appendingPathComponent("Recordings", isDirectory: true)
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            dir = base.appendingPathComponent(BeanStore.demo ? "BeanPod/Demo/Recordings" : "BeanPod/Recordings", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
+
+    /// 数据根目录：Recordings 与其平行的 People 等目录都放这里。
+    var dataRoot: URL {
+        if let dataDir = BeanStore.dataDir { return dataDir }
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent(BeanStore.demo ? "BeanPod/Demo" : "BeanPod", isDirectory: true)
+    }
 
     init() {
         loadLibrary()
