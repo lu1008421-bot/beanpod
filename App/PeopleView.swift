@@ -22,6 +22,9 @@ struct PeopleView: View {
     @State private var addName = ""
     // 样本管理抽屉
     @State private var managingSamples: Person?
+    // 洞察条目编辑
+    @State private var editingInsight: PersonInsight?
+    @State private var insightText = ""
 
     private var confirmed: [Person] {
         let base = store.confirmedPeople
@@ -40,6 +43,8 @@ struct PeopleView: View {
         }
         .navigationTitle("人物")
         .navigationSubtitle(store.confirmedPeople.isEmpty ? "" : "\(store.confirmedPeople.count) 位联系人")
+        .onAppear { if let p = nav.selectedPersonID ?? nav.returnPersonID { selected = p } }
+        .onChange(of: selected) { _, v in nav.selectedPersonID = v }
         .sheet(item: $naming) { person in
             nameSheet(person)
         }
@@ -107,9 +112,10 @@ struct PeopleView: View {
                     LazyVStack(alignment: .leading, spacing: 4) {
                         if showPending {
                             ForEach(pending) { p in row(p) }
-                        }
-                        ForEach(confirmed) { p in row(p) }
-                    }
+                            }
+                            ForEach(confirmed) { p in row(p) }
+                            meRow
+                            }
                     .padding(.vertical, 8)
                 }
             }
@@ -156,7 +162,9 @@ struct PeopleView: View {
                             .font(.system(size: 14, weight: on ? .semibold : .regular)).foregroundStyle(on ? Theme.warm900 : Theme.warm700).lineLimit(1)
                         if p.isMe { Text("我").font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.accent).padding(.horizontal, 5).padding(.vertical, 1).background(Theme.accent.opacity(0.12), in: .capsule) }
                     }
-                    if let last = p.lastMetAt { Text(last.formatted(.relative(presentation: .named))).font(.system(size: 11)).foregroundStyle(Theme.warm400) }
+                    if p.status == .pending, let c = store.firstContext(personID: p.id) {
+                    Text("\(c.date?.formatted(.dateTime.month().day()) ?? "") · \(c.title)").font(.system(size: 11)).foregroundStyle(Theme.warm400).lineLimit(1)
+                    } else if let last = p.lastMetAt { Text(last.formatted(.relative(presentation: .named))).font(.system(size: 11)).foregroundStyle(Theme.warm400) }
                 }
                 Spacer(minLength: 0)
             }
@@ -168,6 +176,25 @@ struct PeopleView: View {
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 
+    /// 「我的声音」：单独一行，不混在联系人里。还没有这张卡时点一下就建。
+    @ViewBuilder private var meRow: some View {
+        if let me = store.mePerson {
+            row(me)
+        } else if store.peopleDB != nil {
+            Button {
+                if let id = store.createPerson(name: String(localized: "我"), status: .confirmed, isMe: true) { selected = id }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "person.crop.circle.dashed").font(.system(size: 15)).foregroundStyle(Theme.warm400).frame(width: 32, height: 32)
+                    Text("我的声音").font(.system(size: 13)).foregroundStyle(Theme.warm500)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).help("管理「我」的声音样本。在文字稿里把某句标成「我」时会用到")
+        }
+    }
+    
     private func avatar(_ p: Person, size: CGFloat) -> some View {
         let pending = p.status == .pending
         let color = pending ? Theme.warm500 : Theme.speakers[abs(p.colorIndex) % Theme.speakers.count]
@@ -202,12 +229,15 @@ struct PeopleView: View {
     @ViewBuilder private func personDetail(_ p: Person) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                header(p)
-                if p.status == .pending {
-                    pendingActions(p)
-                } else {
-                    content(p)
-                }
+            // 样本、时间线、资料都是从人物库现读的：靠这个计数让增删改之后界面马上重画
+            let _ = store.peopleRevision
+            header(p)
+            if p.status == .pending {
+            pendingActions(p)
+            } else {
+            if !suggestions(for: p).isEmpty { suggestionCard(p) }
+            content(p)
+            }
             }
             .padding(20)
             .frame(maxWidth: 820, alignment: .leading)
@@ -239,14 +269,19 @@ struct PeopleView: View {
                 }
             }
             Spacer()
-            if p.status == .confirmed, !p.isMe {
-                Menu {
-                    Button { importingFor = p } label: { Label("导入声音样本", systemImage: "waveform.badge.plus") }
-                    Button { mergingInto = p } label: { Label("合并到这张卡…", systemImage: "arrow.triangle.merge") }
-                    Button { store.undoLastMerge() } label: { Label("撤销上次合并", systemImage: "arrow.uturn.backward") }
-                    Divider()
-                    Button(role: .destructive) { store.deletePerson(id: p.id) } label: { Label("删除人物", systemImage: "trash") }
-                } label: {
+            if p.status == .confirmed {
+            Menu {
+            Button { importingFor = p } label: { Label("导入声音样本", systemImage: "waveform.badge.plus") }
+            if !p.isMe {
+            Button { mergingInto = p } label: { Label("合并到这张卡…", systemImage: "arrow.triangle.merge") }
+            Button { store.undoLastMerge() } label: { Label("撤销上次合并", systemImage: "arrow.uturn.backward") }
+            Divider()
+            Button(role: .destructive) { store.deletePerson(id: p.id) } label: { Label("删除人物", systemImage: "trash") }
+            } else {
+            Divider()
+            Button(role: .destructive) { store.setMe(personID: nil); store.deletePerson(id: p.id) } label: { Label("删除「我的声音」", systemImage: "trash") }
+            }
+            } label: {
                     Image(systemName: "ellipsis").font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.warm500)
                         .frame(width: 28, height: 28).contentShape(Rectangle())
                 }
@@ -258,8 +293,30 @@ struct PeopleView: View {
     }
 
     private func pendingActions(_ p: Person) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        // 代表原声：挑最长的一段，按时间排；每段最多听 8 秒
+        let clips = Array(store.samples(personID: p.id)
+            .filter { $0.sourceKind == .recordingSpan && $0.recordingID != nil }
+            .sorted { ($0.endMs - $0.startMs) > ($1.endMs - $1.startMs) }
+            .prefix(3)).sorted { $0.startMs < $1.startMs }
+        let context = store.firstContext(personID: p.id)
+        return VStack(alignment: .leading, spacing: 14) {
             Text("这个声音还没记名字。可以先听几段代表原声再决定。").font(.callout).foregroundStyle(.secondary)
+            if !clips.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("代表原声").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.warm500)
+                    ForEach(clips) { s in clipRow(s) }
+                }
+            }
+            if let context {
+                HStack(spacing: 8) {
+                    Image(systemName: "mappin.and.ellipse").font(.caption).foregroundStyle(Theme.warm400)
+                    Text("出现在 \(context.date?.formatted(.dateTime.month().day()) ?? "") · \(context.title)")
+                        .font(.callout).foregroundStyle(Theme.warm700).lineLimit(1)
+                    Button("去文字稿") { nav.openTranscript(recording: context.recordingID, start: context.start, fromPerson: p.id) }
+                        .buttonStyle(.link).font(.callout)
+                }
+                .help(context.snippet)
+            }
             HStack(spacing: 10) {
                 TextField("记下名字", text: $namingText).textFieldStyle(.roundedBorder).frame(maxWidth: 220)
                     .onSubmit { store.namePendingPerson(id: p.id, name: namingText); namingText = "" }
@@ -276,6 +333,58 @@ struct PeopleView: View {
         .padding(16).frame(maxWidth: .infinity, alignment: .leading).panel(radius: Theme.Radius.panel)
     }
 
+    /// 一段代表原声：点一下就地听 8 秒，再点停。
+    private func clipRow(_ s: VoiceSample) -> some View {
+        guard let rid = s.recordingID else { return AnyView(EmptyView()) }
+        let start = Double(s.startMs) / 1000
+        let end = min(Double(s.endMs) / 1000, start + 8)
+        let on = store.isPlaying && store.playingID == rid && (store.loopSpan.map { abs($0.lowerBound - start) < 0.01 } ?? false)
+        let title = store.recordings.first(where: { $0.id == rid })?.displayTitle ?? ""
+        return AnyView(
+            HStack(spacing: 10) {
+                Button { if on { store.stop() } else { store.playSpan(rid, start...max(start + 0.3, end), loop: false) } } label: {
+                    Label(on ? "停" : "听", systemImage: on ? "stop.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.accent)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(Theme.accent.opacity(0.1), in: .capsule)
+                }
+                .buttonStyle(.plain)
+                Text("\(title) · \(clock(start)) – \(clock(Double(s.endMs) / 1000)) · \(String(format: "%.0f", Double(s.endMs - s.startMs) / 1000)) 秒")
+                    .font(.callout).foregroundStyle(Theme.warm700).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+        )
+    }
+    
+    /// 「疑似 TA」：分人时像这个人、但分数不够自动署名的声音，由用户点「就是 TA / 不是」。
+    private func suggestions(for p: Person) -> [SpeakerSuggestion] {
+        store.suggestions().filter { $0.candidateID == p.id }
+    }
+    
+    private func suggestionCard(_ p: Person) -> some View {
+        section("请确认是不是 TA") {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(suggestions(for: p)) { s in
+                    let title = store.recordings.first(where: { $0.id == s.recordingID })?.displayTitle ?? ""
+                    let start = Double(s.startMs) / 1000
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("有一段声音疑似 TA（相似度 \(Int((s.score * 100).rounded()))%）").font(.callout)
+                            Text(title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        Button { store.playSpan(s.recordingID, start...max(start + 0.3, min(Double(s.endMs) / 1000, start + 8)), loop: false) } label: {
+                            Image(systemName: "play.circle").font(.system(size: 15))
+                        }
+                        .buttonStyle(.bordered).help("听一听")
+                        Button("就是 TA") { store.acceptSuggestion(s) }.buttonStyle(.glassProminent).tint(Theme.accent)
+                        Button("不是") { store.rejectSuggestion(s) }.buttonStyle(.bordered)
+                    }
+                }
+            }
+        }
+    }
+    
     @ViewBuilder private func content(_ p: Person) -> some View {
         if !p.note.isEmpty {
             section("备注") { Text(p.note).font(.callout).foregroundStyle(.secondary) }
@@ -297,7 +406,7 @@ struct PeopleView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(group.date).font(.caption.weight(.semibold)).foregroundStyle(Theme.warm500)
                             ForEach(group.rows) { row in
-                                timelineRow(row)
+                            timelineRow(row, person: p)
                             }
                         }
                     }
@@ -310,34 +419,58 @@ struct PeopleView: View {
     }
 
     private func insightList(_ items: [PersonInsight]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(items) { it in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "quote.opening").font(.caption).foregroundStyle(Theme.warm400)
-                    Text(it.text).font(.callout)
-                    Spacer(minLength: 0)
-                    if let rid = it.recordingID, let s = it.startMs, let e = it.endMs {
-                        Button { store.playSpan(rid, Double(s) / 1000...Double(max(s, e)) / 1000, loop: false) } label: {
-                            Image(systemName: "play.circle.fill").font(.system(size: 15)).foregroundStyle(Theme.accent)
-                        }
-                        .buttonStyle(.plain).help("就地试听")
-                    }
-                }
-            }
-        }
+    VStack(alignment: .leading, spacing: 6) {
+    ForEach(items) { it in insightRow(it) }
+    }
+    }
+    
+    /// 一条人物资料：能就地试听、改写、移除（移除是软删）。
+    private func insightRow(_ it: PersonInsight) -> some View {
+    HStack(alignment: .firstTextBaseline, spacing: 8) {
+    Image(systemName: "quote.opening").font(.caption).foregroundStyle(Theme.warm400)
+    if editingInsight?.id == it.id {
+    TextField("改成", text: $insightText, axis: .vertical).textFieldStyle(.roundedBorder).font(.callout)
+    .onSubmit { commitInsightEdit(it) }
+    Button("保存") { commitInsightEdit(it) }.buttonStyle(.glassProminent).tint(Theme.accent)
+    .disabled(insightText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    Button("取消") { editingInsight = nil }.buttonStyle(.bordered)
+    } else {
+    Text(it.text).font(.callout)
+    Spacer(minLength: 0)
+    if let rid = it.recordingID, let s = it.startMs, let e = it.endMs {
+    Button { store.playSpan(rid, Double(s) / 1000...Double(max(s, e)) / 1000, loop: false) } label: {
+    Image(systemName: "play.circle.fill").font(.system(size: 15)).foregroundStyle(Theme.accent)
+    }
+    .buttonStyle(.plain).help("就地试听")
+    }
+    Button { insightText = it.text; editingInsight = it } label: {
+    Image(systemName: "pencil").font(.system(size: 12)).foregroundStyle(.secondary)
+    }
+    .buttonStyle(.plain).help("修改这条")
+    Button(role: .destructive) { store.hideInsight(it) } label: {
+    Image(systemName: "xmark").font(.system(size: 11)).foregroundStyle(.secondary)
+    }
+    .buttonStyle(.plain).help("移除这条")
+    }
+    }
+    }
+    
+    private func commitInsightEdit(_ it: PersonInsight) {
+    store.editInsight(it, text: insightText)
+    editingInsight = nil
     }
 
-    private func timelineRow(_ row: PersonTimelineRow) -> some View {
+    private func timelineRow(_ row: PersonTimelineRow, person: Person) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Button { store.playSpan(row.recordingID, row.start...max(row.start, row.end), loop: false) } label: {
                 Image(systemName: "play.circle.fill").font(.system(size: 16)).foregroundStyle(Theme.accent)
             }
             .buttonStyle(.plain).help("从这里听")
             VStack(alignment: .leading, spacing: 2) {
-                Button { nav.open(row.recordingID) } label: {
-                    Text(row.title).font(.callout.weight(.medium)).foregroundStyle(Theme.warm900).lineLimit(1)
+                Button { nav.openTranscript(recording: row.recordingID, start: row.start, fromPerson: person.id) } label: {
+                Text(row.title).font(.callout.weight(.medium)).foregroundStyle(Theme.warm900).lineLimit(1)
                 }
-                .buttonStyle(.plain).help("去文字稿查看")
+                .buttonStyle(.plain).help("去文字稿看这句")
                 if !row.snippet.isEmpty { Text(row.snippet).font(.callout).foregroundStyle(.secondary).lineLimit(2) }
             }
             Spacer(minLength: 0)
@@ -430,36 +563,59 @@ struct PeopleView: View {
     }
 
     private func sampleSheet(_ p: Person) -> some View {
-        let samples = store.samples(personID: p.id)
-        return VStack(alignment: .leading, spacing: 12) {
-            Text("声音样本").font(.headline)
-            if samples.isEmpty {
-                Text("还没有样本。点右上角「⋯」→「导入声音样本」。").font(.callout).foregroundStyle(.secondary)
-            } else {
-                ForEach(samples) { s in
-                    HStack(spacing: 10) {
-                        if let name = s.managedFile {
-                            Button { store.playSampleFile(name) } label: {
-                                Image(systemName: store.isPlaying && store.playingID == nil ? "pause.circle.fill" : "play.circle.fill")
-                                    .font(.system(size: 16)).foregroundStyle(Theme.accent)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(s.channel == .speakerLoopback ? "外放" : "近场") · \(msLabel(s))").font(.callout)
-                            Text(s.sourceKind == .importedFile ? "导入" : "来自录音").font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button(role: .destructive) { store.deleteSample(personID: p.id, sampleID: s.id) } label: {
-                            Image(systemName: "trash").font(.system(size: 13)).foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain).help("删除样本")
-                    }
-                }
-            }
-            HStack { Spacer(); Button("完成") { managingSamples = nil }.buttonStyle(.glassProminent).tint(Theme.accent) }
-        }
-        .padding(20).frame(minWidth: 360)
+    // 增删样本后靠 peopleRevision 让这张表重画
+    let _ = store.peopleRevision
+    let samples = store.samples(personID: p.id)
+    return VStack(alignment: .leading, spacing: 12) {
+    Text("声音样本").font(.headline)
+    if samples.isEmpty {
+    Text("还没有样本。从录音里认出来的会自动留一段；也可以导入一段只含 TA 说话的音频。").font(.callout).foregroundStyle(.secondary)
+    } else {
+    ForEach(samples) { s in sampleSheetRow(s, person: p) }
+    }
+    HStack {
+    Spacer()
+    Button { managingSamples = nil; importingFor = p } label: { Label("导入声音样本", systemImage: "waveform.badge.plus") }
+    .buttonStyle(.bordered)
+    Button("完成") { managingSamples = nil }.buttonStyle(.glassProminent).tint(Theme.accent)
+    }
+    }
+    .padding(20).frame(minWidth: 380)
+    }
+    
+    /// 样本一行：导入的文件和从录音里截的代表段都能就地试听；正在播的只有这一行变成暂停。
+    private func sampleSheetRow(_ s: VoiceSample, person p: Person) -> some View {
+    let (on, play): (Bool, () -> Void) = {
+    if let name = s.managedFile {
+    return (store.isPlaying && store.playingSampleFile == name, { store.playSampleFile(name) })
+    }
+    guard let rid = s.recordingID else { return (false, {}) }
+    let start = Double(s.startMs) / 1000
+    let end = Double(max(s.startMs + 300, s.endMs)) / 1000
+    let playing = store.isPlaying && store.playingID == rid && (store.loopSpan.map { abs($0.lowerBound - start) < 0.01 } ?? false)
+    return (playing, { playing ? store.stop() : store.playSpan(rid, start...end, loop: false) })
+    }()
+    return HStack(spacing: 10) {
+    Button(action: play) {
+    Image(systemName: on ? "pause.circle.fill" : "play.circle.fill")
+    .font(.system(size: 16)).foregroundStyle(Theme.accent)
+    }
+    .buttonStyle(.plain).help(on ? "暂停" : "试听这段")
+    VStack(alignment: .leading, spacing: 2) {
+    Text("\(s.channel == .speakerLoopback ? "外放" : "近场") · \(msLabel(s))\(s.confirmed ? "" : " · 未确认")").font(.callout)
+    if s.sourceKind == .importedFile {
+    Text("导入").font(.caption).foregroundStyle(.secondary)
+    } else if let rid = s.recordingID {
+    let title = store.recordings.first(where: { $0.id == rid })?.displayTitle ?? ""
+    Text("来自录音「\(title)」\(clock(Double(s.startMs) / 1000))").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+    }
+    }
+    Spacer()
+    Button(role: .destructive) { store.deleteSample(personID: p.id, sampleID: s.id) } label: {
+    Image(systemName: "trash").font(.system(size: 13)).foregroundStyle(.secondary)
+    }
+    .buttonStyle(.plain).help("删除样本")
+    }
     }
 
     private func msLabel(_ s: VoiceSample) -> String {
