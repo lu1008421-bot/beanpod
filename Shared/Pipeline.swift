@@ -14,6 +14,9 @@ extension BeanStore {
     func refreshASRAvailability() {
         asrAvailable = QwenASR.locateServer(custom: settings.llamaServerPath) != nil && QwenASR.locateModel() != nil
         localLLMReady = QwenASR.locateServer(custom: settings.llamaServerPath) != nil && LocalLLM.modelURL != nil
+        #if os(macOS)
+        speakerModelsReady = SpeakerEngine.hasSegmentationModel() && SpeakerEngine.hasEmbeddingModel()
+        #endif
     }
 
     /// 云端（或用户自己填的任何服务）的配置。
@@ -132,7 +135,25 @@ extension BeanStore {
 
     private func index(_ id: UInt32) -> Int? { recordings.firstIndex { $0.id == id } }
 
+    /// 跑完一条录音后统一收尾：场景已定，新声音该建卡的建卡，再把人物身份投影回录音库。
+    /// 放在这里而不是各分支里，是为了整理失败、场景拦截建卡这些提前返回的情况也不会漏掉投影。
     private func run(_ id: UInt32) async {
+        await runBody(id)
+        guard recordings.contains(where: { $0.id == id }) else { return }
+        #if os(macOS)
+        finalizeStrangerCards(id)
+        syncPeopleToLibrary([id])
+        // 人物摘要排在润色之后、同一个串行队列里跑：模型还开着，不会被队列收尾时的 stop 打断
+        let attributed = (try? peopleDB?.listUtterances(recordingID: id))?.contains { $0.personID != nil } ?? false
+        if attributed, localLLMReady, LocalLLM.modelURL != nil {
+            await runPeopleInsights(id)
+        }
+        #else
+        syncPeopleToLibrary([id])
+        #endif
+    }
+
+    private func runBody(_ id: UInt32) async {
         guard let rec = recordings.first(where: { $0.id == id }) else { return }
 
         // 1. 转写
@@ -140,6 +161,7 @@ extension BeanStore {
             stages[id] = .transcribing(0)
             do {
                 let segments: [Segment], engine: String
+                var bySpeaker = false      // 这次转写是不是已经按说话人切的（路径 A）
                 refreshASRAvailability()
                 if settings.engine == .cloud || viaCloud.contains(id), let asr = settings.asrConfig {
                     // 云端转写：录音会发给用户自己填的那家服务商
@@ -159,6 +181,7 @@ extension BeanStore {
                             }
                         }
                         engine = QwenASR.displayName + " · 声纹分人"
+                        bySpeaker = true
                     } else {
                         segments = try await QwenASR.shared.transcribe(wavURL(id), serverPath: settings.llamaServerPath) { fraction in
                             Task { @MainActor [weak self] in
@@ -181,7 +204,12 @@ extension BeanStore {
                     engine = "系统语音识别"
                 }
                 guard let i = index(id) else { return }
-                recordings[i].segments = segments.map { Segment(start: $0.start, text: applyVocabulary($0.text), speaker: $0.speaker, end: $0.end) }
+                var fresh = segments.map { Segment(start: $0.start, text: applyVocabulary($0.text), speaker: $0.speaker, end: $0.end) }
+                #if os(macOS)
+                // 路径 B：文字稿不是按说话人切的（云端转写、系统识别），本地有 WAV 就分人后按时间对齐
+                if !bySpeaker { await alignTranscriptWithSpeakers(id, segments: &fresh) }
+                #endif
+                recordings[i].segments = fresh
                 recordings[i].transcript = recordings[i].segments.map(\.text).joined(separator: "\n")
                 recordings[i].transcribedBy = engine
                 syncLocalSpeakers(id, from: segments)
@@ -247,15 +275,6 @@ extension BeanStore {
         recordings[j].people = result.people
         recordings[j].analyzedBy = result.source
         saveLibrary()
-
-        #if os(macOS)
-        // 场景已定：把达标且场景允许的新声音升格为待认识卡，再触发有依据的人物摘要抽取
-        finalizeStrangerCards(id)
-        let hasAttributedSpeech = (try? peopleDB?.listUtterances(recordingID: id).contains { $0.personID != nil }) ?? false
-        if hasAttributedSpeech, localLLMReady, LocalLLM.modelURL != nil {
-            Task { await runPeopleInsights(id) }
-        }
-        #endif
 
         // 3. 润色：每句出一个去掉语气词、理顺了的版本，原文照旧留着
         let raw = recordings[j].segments
@@ -1062,7 +1081,7 @@ extension BeanStore {
     func downloadSpeakerModels() {
         if let job = speakerJob { job.start(); return }
         let job = DownloadJob(files: SpeakerModels.defaults, folder: SpeakerEngine.modelFolder)
-        job.onFinish = { [weak self] ok in self?.speakerJob = nil; if ok { self?.addLog("声纹模型下载好了") } }
+        job.onFinish = { [weak self] ok in self?.speakerJob = nil; self?.refreshASRAvailability(); if ok { self?.addLog("声纹模型下载好了") } }
         speakerJob = job
         job.start()
     }
@@ -1086,7 +1105,7 @@ extension BeanStore {
         }
         #if os(macOS)
         if speakerJob == nil, let j = paused(SpeakerModels.defaults, SpeakerEngine.modelFolder) {
-            j.onFinish = { [weak self] _ in self?.speakerJob = nil }
+            j.onFinish = { [weak self] _ in self?.speakerJob = nil; self?.refreshASRAvailability() }
             speakerJob = j
         }
         #endif

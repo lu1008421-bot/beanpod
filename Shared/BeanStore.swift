@@ -148,11 +148,11 @@ final class BeanStore {
     var llmJob: DownloadJob?
     #if os(macOS)
     var speakerJob: DownloadJob?
-    /// 声纹模型是否就绪（分割 + 声纹向量都在）。
-    var speakerModelsReady: Bool {
-        SpeakerEngine.hasSegmentationModel() && SpeakerEngine.hasEmbeddingModel()
-    }
+    /// 声纹模型是否就绪（分割 + 声纹向量都在）。存起来而不是每次查磁盘，界面才跟得上下载完成。
+    var speakerModelsReady = false
     #endif
+    /// 人物库有增删改时加一，界面据此刷新样本数、时间线和资料。
+    var peopleRevision = 0
     var modelDownload: Double? { asrJob?.fraction }
     var llmDownload: Double? { llmJob?.fraction }
     /// 正在保存或下载画面的素材（VideoKeep.swift）。
@@ -175,6 +175,8 @@ final class BeanStore {
 
     // 播放
     var playingID: UInt32?
+    /// 正在播的受管声音样本文件名（和录音播放互斥）。
+    var playingSampleFile: String?
     var isPlaying = false
     var playhead: TimeInterval = 0
 
@@ -1215,17 +1217,22 @@ final class BeanStore {
     func stop() {
         loopSpan = nil; loopCount = 0; stopAt = nil
         ticker?.cancel(); player?.stop(); player = nil
-        playingID = nil; isPlaying = false; playhead = 0
+        playingID = nil; playingSampleFile = nil; isPlaying = false; playhead = 0
     }
 
     #if os(macOS)
     /// 播放受管声音样本（与主录音播放器互斥）。样本是 `People/Samples/` 下独立的 wav 文件。
     func playSampleFile(_ name: String) {
+        // 同一段再点一次：暂停 / 接着放
+        if playingSampleFile == name, let player {
+            if player.isPlaying { player.pause(); isPlaying = false } else { player.play(); isPlaying = true; tick() }
+            return
+        }
         let url = dataRoot.appendingPathComponent("People/Samples").appendingPathComponent(name)
         stop()
         guard let p = try? AVAudioPlayer(contentsOf: url) else { return }
         p.enableRate = true; p.rate = playRate
-        player = p; playingID = nil; playhead = 0
+        player = p; playingID = nil; playingSampleFile = name; playhead = 0
         p.play(); isPlaying = true
         tick()
     }

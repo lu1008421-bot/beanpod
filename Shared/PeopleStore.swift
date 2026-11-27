@@ -21,6 +21,8 @@ extension BeanStore {
 
     /// 把人物身份投影回录音库：更新 `Recording.people`（去重后的已确认人名）与
     /// `Recording.speakers`（说话人显示名投影），并写回 `library.json`。
+    /// `Recording.people` 是两份名单合并的结果：纪要整理时模型提到的人物保留，声纹认出的人名排在最前；
+    /// 上次由声纹写入、这次已不成立的名字才会被拿掉。
     /// - Parameter ids: 只同步这些录音；nil 表示全部。
     func syncPeopleToLibrary(_ ids: [UInt32]? = nil) {
         guard let db = peopleDB else { return }
@@ -31,27 +33,43 @@ extension BeanStore {
         } else {
             targets = Array(recordings.indices)
         }
+        var changed = false
         for i in targets {
             let rec = recordings[i]
-            let utterances = (try? db.listUtterances(recordingID: rec.id)) ?? []
-            guard !utterances.isEmpty else { continue }
+            // 被用户排除出「人物」的录音：只清掉以前声纹写入的名字，不写入新的
+            let utterances = rec.peopleExcluded ? [] : ((try? db.listUtterances(recordingID: rec.id)) ?? [])
+            guard !utterances.isEmpty else {
+                if !rec.voicePeople.isEmpty {
+                    recordings[i].people = PeopleProjection.removingVoice(rec.people, voicePeople: rec.voicePeople)
+                    recordings[i].voicePeople = []
+                    changed = true
+                }
+                continue
+            }
 
             // localSpeaker → personID；人工指定优先于自动
             var speakerPerson: [Int: UUID] = [:]
+            var firstAppear: [Int: Int] = [:]
             for u in utterances {
                 guard let pid = u.personID else { continue }
                 if speakerPerson[u.localSpeaker] == nil || u.source == "manual" { speakerPerson[u.localSpeaker] = pid }
+                firstAppear[u.localSpeaker] = min(firstAppear[u.localSpeaker] ?? Int.max, u.startMs)
             }
 
-            // Recording.people：去重后的已确认人物名，按出现顺序
+            // 声纹认出的已确认人物名：去重，按第一次开口的先后
             var seen = Set<String>()
             var names: [String] = []
-            for idx in speakerPerson.keys.sorted() {
+            for idx in speakerPerson.keys.sorted(by: { (firstAppear[$0] ?? 0) < (firstAppear[$1] ?? 0) }) {
                 guard let pid = speakerPerson[idx], let p = personsByID[pid],
                       p.status == .confirmed, !p.displayName.isEmpty else { continue }
                 if seen.insert(p.displayName).inserted { names.append(p.displayName) }
             }
-            recordings[i].people = names
+            let projection = PeopleProjection.merge(llmPeople: rec.people, oldVoicePeople: rec.voicePeople, newVoicePeople: names)
+            if projection.people != rec.people || projection.voicePeople != rec.voicePeople {
+                recordings[i].people = projection.people
+                recordings[i].voicePeople = projection.voicePeople
+                changed = true
+            }
 
             // Recording.speakers：显示名投影（已确认用名字，待认识用内部编号，其余保留）
             let speakerCount = max(rec.speakers.count, (speakerPerson.keys.max() ?? -1) + 1)
@@ -65,9 +83,9 @@ extension BeanStore {
                     speakers[idx] = String(localized: "未记名 \(p.strangerLabel)")
                 }
             }
-            recordings[i].speakers = speakers
+            if speakers != rec.speakers { recordings[i].speakers = speakers; changed = true }
         }
-        saveLibrary()
+        if changed || ids == nil { saveLibrary() }
     }
 
     /// 新建人物（写库 + 更新内存）。返回新人物 id。
@@ -94,6 +112,7 @@ extension BeanStore {
             try db.renamePerson(id: id, to: trimmed)
             if let k = people.firstIndex(where: { $0.id == id }) { people[k].displayName = trimmed }
             syncPeopleToLibrary()
+            peopleRevision += 1
         } catch {
             addLog("人物改名失败：\(error.localizedDescription)")
         }
@@ -105,6 +124,8 @@ extension BeanStore {
         do {
             try db.setMe(id: personID)
             people = people.map { Person(id: $0.id, displayName: $0.displayName, strangerIndex: $0.strangerIndex, colorIndex: $0.colorIndex, status: $0.status, isMe: $0.id == personID, note: $0.note, createdAt: $0.createdAt, lastMetAt: $0.lastMetAt) }
+            syncPeopleToLibrary()
+            peopleRevision += 1
         } catch {
             addLog("设置「我」失败：\(error.localizedDescription)")
         }
@@ -114,6 +135,17 @@ extension BeanStore {
     func reloadPeople() {
         guard let db = peopleDB else { return }
         people = (try? db.listPersons()) ?? []
+    }
+
+    /// 「我」这张卡（全局至多一张）。
+    var mePerson: Person? { people.first(where: { $0.isMe && $0.status != .ignored }) }
+
+    /// 人物显示名：已确认用名字，待认识用内部编号，其它用录音里原来的说话人标签。
+    func personName(_ pid: UUID?, fallback: String?) -> String? {
+        guard let pid, let p = people.first(where: { $0.id == pid }) else { return fallback }
+        if p.status == .confirmed, !p.displayName.isEmpty { return p.displayName }
+        if p.status == .pending { return String(localized: "未记名 \(p.strangerLabel)") }
+        return fallback
     }
 
     /// 已命名人物（按最近交流倒序），供首页主列表。
@@ -137,15 +169,18 @@ extension BeanStore {
         do {
             try db.renamePerson(id: id, to: trimmed)
             try db.setPersonStatus(id: id, .confirmed)
+            // 确认了这张卡，卡上已经核实过的声音样本一起算作已确认
+            try db.confirmSamples(personID: id)
             reloadPeople()
             syncPeopleToLibrary()
+            peopleRevision += 1
         } catch { peopleError = error.localizedDescription }
     }
 
     /// 以后不提示（忽略）。
     func ignorePerson(id: UUID) {
         guard let db = peopleDB else { return }
-        do { try db.setPersonStatus(id: id, .ignored); reloadPeople() }
+        do { try db.setPersonStatus(id: id, .ignored); reloadPeople(); syncPeopleToLibrary(); peopleRevision += 1 }
         catch { peopleError = error.localizedDescription }
     }
 
@@ -156,7 +191,90 @@ extension BeanStore {
             try db.deletePersonCascade(id: id)
             reloadPeople()
             syncPeopleToLibrary()
+            peopleRevision += 1
         } catch { peopleError = error.localizedDescription }
+    }
+
+    /// 这条录音参不参与「人物」。排除后不再分人、不进任何人的时间线与资料；重新处理也不会把它算进去。
+    func setPeopleExcluded(recordingID: UInt32, _ excluded: Bool) {
+        guard let i = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        recordings[i].peopleExcluded = excluded
+        if excluded {
+            recordings[i].people = PeopleProjection.removingVoice(recordings[i].people, voicePeople: recordings[i].voicePeople)
+            recordings[i].voicePeople = []
+        }
+        saveLibrary()
+        peopleRevision += 1
+    }
+
+    /// 某条录音的声学说话人时间线（按说话人切出来的区间，不含身份）：逐句没有时间戳时用它回听是谁在说。
+    func acousticTimeline(recordingID: UInt32) -> [(start: TimeInterval, end: TimeInterval, speaker: Int)] {
+        guard let db = peopleDB, let i = recordings.firstIndex(where: { $0.id == recordingID }),
+              !recordings[i].peopleExcluded else { return [] }
+        let utts = ((try? db.listUtterances(recordingID: recordingID)) ?? [])
+            .sorted { $0.startMs < $1.startMs }
+        return utts.filter { $0.endMs > $0.startMs }.map { (Double($0.startMs) / 1000, Double($0.endMs) / 1000, $0.localSpeaker) }
+    }
+
+    /// 某人在哪条录音里第一次出现（日期 + 标题），待认识卡用来说明「这个声音是在哪听到的」。
+    func firstContext(personID: UUID) -> PersonTimelineRow? {
+        timeline(personID: personID).min(by: { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) })
+    }
+
+    /// 「疑似某人」的匹配建议：分人时像某位已有人物、但分数不够自动署名，留给用户定。
+    func suggestions() -> [SpeakerSuggestion] {
+        guard let db = peopleDB else { return [] }
+        return (try? db.listSuggestions()) ?? []
+    }
+
+    /// 采纳「疑似某人」：这个人在这条录音里的发言全部归到 TA，并记下样本供以后自动认出。
+    func acceptSuggestion(_ s: SpeakerSuggestion) {
+        guard let db = peopleDB, let i = recordings.firstIndex(where: { $0.id == s.recordingID }) else { return }
+        do {
+            try db.assignUtterancesByLocalSpeaker(recordingID: s.recordingID, localSpeaker: s.localSpeaker, personID: s.candidateID)
+            // 用户认下了这段声音：它的中心声纹存成这个人的已确认样本
+            if !s.vector.isEmpty {
+                let sample = VoiceSample(id: UUID(), personID: s.candidateID, sourceKind: .recordingSpan, recordingID: s.recordingID,
+                                         startMs: s.startMs, endMs: s.endMs, managedFile: nil, channel: recordings[i].speakerChannel,
+                                         confirmed: true, modelVersion: SpeakerEngine.embeddingCAMPPName,
+                                         contentHash: "recording-\(s.recordingID)-\(s.localSpeaker)-\(s.startMs)")
+                try db.addSample(sample, embedding: s.vector)
+            }
+            try db.setLastMet(id: s.candidateID, recordings[i].date)
+            try db.deleteJob(id: s.id)
+            // 这个声音如果已经另建了待认识卡，一并并掉
+            for other in people where other.status == .pending {
+                if samples(personID: other.id).contains(where: { $0.recordingID == s.recordingID && $0.startMs < s.endMs && $0.endMs > s.startMs }) {
+                    try db.deletePersonCascade(id: other.id)
+                }
+            }
+            reloadPeople()
+            syncPeopleToLibrary([s.recordingID])
+            peopleRevision += 1
+        } catch { peopleError = error.localizedDescription }
+    }
+
+    /// 驳回「疑似某人」：这个人 × 这条录音里的这个声音不再推荐。
+    func rejectSuggestion(_ s: SpeakerSuggestion) {
+        guard let db = peopleDB else { return }
+        do {
+            try db.addRejectedPair("\(s.candidateID.uuidString)|\(s.recordingID)-\(s.localSpeaker)")
+            try db.deleteJob(id: s.id)
+            peopleRevision += 1
+        } catch { peopleError = error.localizedDescription }
+    }
+
+    /// 编辑 / 移除一条人物资料（移除是软删，数据库里还留着）。
+    func editInsight(_ insight: PersonInsight, text: String) {
+        guard let db = peopleDB, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        do { try db.editInsight(id: insight.id, text: text); peopleRevision += 1 }
+        catch { peopleError = error.localizedDescription }
+    }
+
+    func hideInsight(_ insight: PersonInsight) {
+        guard let db = peopleDB else { return }
+        do { try db.hideInsight(id: insight.id); peopleRevision += 1 }
+        catch { peopleError = error.localizedDescription }
     }
 
     /// 单句改归属：只改目标句对应区间，不串改同一 `localSpeaker` 的其它句子。
@@ -169,7 +287,7 @@ extension BeanStore {
         let startMs = Int(seg.start * 1000)
         let endMs = max(startMs + 1, Int((seg.end ?? (seg.start + 1)) * 1000))
         let newLocal = recordings[i].speakers.count
-        recordings[i].speakers.append("")
+        recordings[i].speakers.append(String(localized: "说话人 \(newLocal + 1)"))
         seg.speaker = newLocal
         recordings[i].segments[segIdx] = seg
         saveLibrary()
@@ -189,6 +307,7 @@ extension BeanStore {
             }
             syncPeopleToLibrary([recordingID])
             reloadPeople()
+            peopleRevision += 1
         } catch { peopleError = error.localizedDescription }
     }
 
@@ -199,6 +318,7 @@ extension BeanStore {
             _ = try db.mergePersons(primary: primary, secondary: secondary)
             reloadPeople()
             syncPeopleToLibrary()
+            peopleRevision += 1
         } catch { peopleError = error.localizedDescription }
     }
 
@@ -209,6 +329,7 @@ extension BeanStore {
             try db.undoMerge(logID: last.id)
             reloadPeople()
             syncPeopleToLibrary()
+            peopleRevision += 1
         } catch { peopleError = error.localizedDescription }
     }
 
@@ -216,7 +337,7 @@ extension BeanStore {
     func insights(personID: UUID) -> [PersonInsight] {
         guard let db = peopleDB else { return [] }
         let all = (try? db.listInsights(personID: personID)) ?? []
-        let live = Set(recordings.map(\.id))
+        let live = Set(recordings.filter { !$0.peopleExcluded }.map(\.id))
         return all.filter { $0.recordingID == nil || live.contains($0.recordingID!) }
     }
 
@@ -230,7 +351,7 @@ extension BeanStore {
     func timeline(personID: UUID) -> [PersonTimelineRow] {
         guard let db = peopleDB else { return [] }
         let utts = (try? db.listUtterancesForPerson(personID: personID)) ?? []
-        let recByID = Dictionary(uniqueKeysWithValues: recordings.map { ($0.id, $0) })
+        let recByID = Dictionary(uniqueKeysWithValues: recordings.filter { !$0.peopleExcluded }.map { ($0.id, $0) })
         return utts.compactMap { u in
             guard let rec = recByID[u.recordingID] else { return nil }
             let segs = rec.segments.filter { seg in
@@ -251,18 +372,25 @@ extension BeanStore {
         do {
             let samples = try SpeakerEngine.loadMono16k(url)
             guard !samples.isEmpty else { return false }
+            let wavData = QwenASR.wav(samples)
+            let contentHash = SHA256.hash(data: wavData).map { String(format: "%02x", $0) }.joined()
+            // 同一段音频不重复入库
+            if try db.sampleExists(personID: personID, contentHash: contentHash) { return true }
             let samplesDir = dataRoot.appendingPathComponent("People/Samples", isDirectory: true)
             try FileManager.default.createDirectory(at: samplesDir, withIntermediateDirectories: true)
             let managed = samplesDir.appendingPathComponent("\(UUID().uuidString).wav")
-            let wavData = QwenASR.wav(samples)
             try wavData.write(to: managed, options: .atomic)
             let embedding = await SpeakerEngine.shared.embedWhole(samples)
-            let contentHash = SHA256.hash(data: wavData).map { String(format: "%02x", $0) }.joined()
             let sample = VoiceSample(id: UUID(), personID: personID, sourceKind: .importedFile, recordingID: nil,
                                      startMs: 0, endMs: samples.count * 1000 / 16000, managedFile: managed.lastPathComponent,
                                      channel: .nearField, confirmed: true, modelVersion: SpeakerEngine.embeddingCAMPPName,
                                      contentHash: contentHash)
-            try db.addSample(sample, embedding: embedding)
+            if try db.addSample(sample, embedding: embedding) {
+                peopleRevision += 1
+                reloadPeople()
+            } else {
+                try? FileManager.default.removeItem(at: managed)
+            }
             return true
         } catch {
             peopleError = error.localizedDescription
@@ -274,8 +402,15 @@ extension BeanStore {
     /// 删除某人的一段声音样本（被删样本不再参与匹配）。
     func deleteSample(personID: UUID, sampleID: UUID) {
         guard let db = peopleDB else { return }
-        do { try db.deleteSample(id: sampleID) }
-        catch { peopleError = error.localizedDescription }
+        do {
+            // 受管复制到 People/Samples 的那份一起删掉，不留孤儿文件
+            if let file = try db.sampleFile(id: sampleID) {
+                try? FileManager.default.removeItem(at: dataRoot.appendingPathComponent("People/Samples").appendingPathComponent(file))
+            }
+            try db.deleteSample(id: sampleID)
+            peopleRevision += 1
+            reloadPeople()
+        } catch { peopleError = error.localizedDescription }
     }
 }
 
