@@ -146,6 +146,8 @@ final class BeanStore {
     var serverInstall: String?
     var localLLMReady = false
     var asrAvailable = false
+    var polishing: Set<UInt32> = []
+    var usageEntries: [LLMUsageEntry] = []
 
     // 知识库问答
     var answer: String?
@@ -289,6 +291,7 @@ final class BeanStore {
         loadLibrary()
         loadTrash()
         loadProjects()
+        loadUsageLedger()
         refreshASRAvailability()
         watchInbox()
         #if os(macOS)
@@ -1023,6 +1026,43 @@ final class BeanStore {
     func oggURL(_ id: UInt32) -> URL { folder.appendingPathComponent("\(id).ogg") }
     func wavURL(_ id: UInt32) -> URL { folder.appendingPathComponent("\(id).wav") }
     private var libraryURL: URL { folder.appendingPathComponent("library.json") }
+    var usageLedgerURL: URL { folder.appendingPathComponent("llm_usage.json") }
+
+    var usageSummary: LLMUsageSummary { LLMUsageLedger.summarize(usageEntries) }
+
+    private func loadUsageLedger() {
+        usageEntries = LLMUsageLedger.load(from: usageLedgerURL)
+    }
+
+    func clearUsageLedger() {
+        usageEntries = []
+        try? FileManager.default.removeItem(at: usageLedgerURL)
+    }
+
+    func recordLLMUsage(
+        task: LLMTaskKind,
+        tier: LLMTier,
+        config: LLMConfig,
+        recordingID: UInt32? = nil,
+        usage: LLMTokenUsage
+    ) {
+        let entry = LLMUsageEntry(
+            task: task,
+            tier: tier,
+            model: config.model,
+            providerHost: config.providerHost,
+            builtInLocal: config.builtIn,
+            recordingID: recordingID,
+            usage: usage
+        )
+        usageEntries = LLMUsageLedger.append(entry, to: usageEntries)
+        try? LLMUsageLedger.save(usageEntries, to: usageLedgerURL)
+        if let recordingID, usage.totalTokens > 0,
+           let i = recordings.firstIndex(where: { $0.id == recordingID }) {
+            recordings[i].llmTokens += usage.totalTokens
+            saveLibrary()
+        }
+    }
 
     private func loadLibrary() {
         guard let data = try? Data(contentsOf: libraryURL),

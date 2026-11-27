@@ -1,3 +1,4 @@
+import BeanKit
 import Foundation
 
 /// 刚录完的那一条：等用户说「留着」还是「不要」。
@@ -93,7 +94,7 @@ extension BeanStore {
 extension BeanStore {
     /// 只换标题，纪要、待办都不动（重新整理一遍会把打过勾的待办冲掉）。
     func retitle(_ id: UInt32) {
-        guard let rec = recordings.first(where: { $0.id == id }), !retitling.contains(id), analysisAvailable else { return }
+        guard let rec = recordings.first(where: { $0.id == id }), !retitling.contains(id), lightAnalysisAvailable else { return }
         let material = [rec.summary, rec.transcript.map { String($0.prefix(3000)) }].compactMap { $0 }.joined(separator: "\n\n")
         guard !material.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             problem = Problem(title: String(localized: "这条录音还没有文字"), detail: String(localized: "先转写出文字，才能让 AI 起标题。"))
@@ -104,14 +105,15 @@ extension BeanStore {
         Task {
             defer { retitling.remove(id) }
             do {
-                let reply = try await withLLM { config in
-                    try await Analyzer.chat(config,
+                let reply = try await withLLM(task: .retitle, tier: .light, recordingID: id) { config in
+                    let res = try await Analyzer.chatDetailed(config,
                         system: """
                         你给一段录音起标题。要求：一句话，不超过 22 个字，让人不用点开就知道这段录音讲了什么事、得出了什么结论；
                         用录音里的具体人名、事、数字，不要「关于……的讨论」「一段录音」这种空话；不加引号、书名号和句号。
                         只输出标题本身，不要解释。\(old.isEmpty ? "" : "现在的标题是「\(old)」，请换一个角度，不要重复。")
                         """,
                         user: material, json: false)
+                    return (res.content, res.usage)
                 }
                 let title = Analyzer.stripThinking(reply).components(separatedBy: "\n").first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }?
                     .trimmingCharacters(in: CharacterSet(charactersIn: " 「」\"“”《》。#*")) ?? ""

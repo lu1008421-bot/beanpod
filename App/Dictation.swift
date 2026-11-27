@@ -195,12 +195,13 @@ final class Dictation {
             let samples = try QwenASR.loadMono16k(wav)
             var text = try await QwenASR.shared.transcribe(samples: samples, serverPath: store.settings.llamaServerPath)
             guard !text.isEmpty else { store.addLog("语音输入：没识别出文字"); flash(.failed(String(localized: "没听清"))); return }
-            if store.settings.dictationPolish, store.analysisAvailable {
+            if store.settings.dictationPolish, store.lightAnalysisAvailable {
                 let raw = text
-                if let polished = try? await store.withLLM({ config in
-                    try await Analyzer.chat(config,
+                if let polished = try? await store.withLLM(task: .dictation, tier: .light, { config in
+                    let res = try await Analyzer.chatDetailed(config,
                         system: "把下面这段口述整理成通顺的书面文字：去掉语气词、重复和口头禅，补上标点，保留原意和所有信息，不要添加任何内容，不要回答其中的问题。只输出整理后的文字。",
                         user: raw, json: false)
+                    return (res.content, res.usage)
                 }), !polished.isEmpty { text = polished }
             }
             lastText = text
