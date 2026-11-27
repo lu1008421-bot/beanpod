@@ -195,17 +195,20 @@ nonisolated struct Segment: Codable, Equatable, Identifiable {
     var clean: String?
     /// 第几位说话人（从 0 起）。没标记就是空。
     var speaker: Int?
+    /// 这一句的结束时间（秒）。旧 `library.json` 没有这个字段，解码时缺省为 nil 以保持向后兼容。
+    var end: TimeInterval?
     var id: TimeInterval { start }
 
-    init(start: TimeInterval, text: String, clean: String? = nil, speaker: Int? = nil) {
-        self.start = start; self.text = text; self.clean = clean; self.speaker = speaker
+    init(start: TimeInterval, text: String, clean: String? = nil, speaker: Int? = nil, end: TimeInterval? = nil) {
+        self.start = start; self.text = text; self.clean = clean; self.speaker = speaker; self.end = end
     }
 
-    private enum CodingKeys: String, CodingKey { case start, text, clean, speaker }
+    private enum CodingKeys: String, CodingKey { case start, end, text, clean, speaker }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         start = try c.decode(TimeInterval.self, forKey: .start)
+        end = try c.decodeIfPresent(TimeInterval.self, forKey: .end)
         text = try c.decode(String.self, forKey: .text)
         clean = try c.decodeIfPresent(String.self, forKey: .clean)
         speaker = try c.decodeIfPresent(Int.self, forKey: .speaker)

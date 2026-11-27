@@ -116,6 +116,12 @@ final class BeanStore {
     /// 最近删除（Trash.swift）：本机删掉的录音放 7 天，可以恢复。
     var trash: [TrashedRecording] = []
 
+    // 人物（PeopleDB.swift / PeopleStore.swift）：跨录音人物身份的唯一权威源
+    /// 打开失败时为 nil，界面降级为手工人物维护，不阻断原有转写/播放。
+    @ObservationIgnored var peopleDB: PeopleDB?
+    var people: [Person] = []
+    var peopleError: String?
+
     // 录音
     var recordings: [Recording] = []
     /// 自己录的（不含从链接导入的素材）。录音页、总览只看这些；素材只在素材库里
@@ -306,6 +312,7 @@ final class BeanStore {
         loadLibrary()
         loadTrash()
         loadProjects()
+        loadPeople()
         refreshASRAvailability()
         watchInbox()
         #if os(macOS)

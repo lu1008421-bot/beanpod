@@ -96,6 +96,19 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: NO
         SKIP_INSTALL: YES
+  PeopleDBTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Shared/People.swift
+      - Shared/PeopleDB.swift
+      - Tests/PeopleDBTests
+    settings:
+      base:
+        PRODUCT_NAME: PeopleDBTests
+        SWIFT_VERSION: "6.0"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        GENERATE_INFOPLIST_FILE: YES
   BeanPodMobile:
     type: application
     platform: iOS
