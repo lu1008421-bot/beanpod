@@ -7,6 +7,12 @@ import UIKit
 import BeanKit
 import Foundation
 
+private nonisolated struct LLMWorkOutcome<T: Sendable>: Sendable {
+    var value: T
+    var usage: LLMTokenUsage
+    var config: LLMConfig
+}
+
 /// 录音下载之后的流水线：转写 → 判场景、出纪要。再加上知识库的检索、问答和导出。
 extension BeanStore {
     // MARK: 流水线
@@ -21,6 +27,14 @@ extension BeanStore {
         settings.llmConfigured ? LLMConfig(baseURL: settings.llmBaseURL, model: settings.llmModel, key: settings.llmKey) : nil
     }
 
+    var lightCloudConfig: LLMConfig? {
+        settings.lightCloudEndpoint.map { LLMConfig(baseURL: $0.baseURL, model: $0.model, key: $0.key) }
+    }
+
+    private var llmAnalysisMode: LLMAnalysisMode {
+        LLMAnalysisMode(rawValue: settings.analysisMode.rawValue) ?? .auto
+    }
+
     /// 现在有没有能用的分析模型（云端配好了，或者本机模型下好了）。
     var analysisAvailable: Bool {
         switch settings.analysisMode {
@@ -30,25 +44,68 @@ extension BeanStore {
         }
     }
 
-    /// 按设置的先后顺序，挨个试能用的模型，直到有一个成功。
-    func withLLM<T: Sendable>(_ work: @Sendable (LLMConfig) async throws -> T) async throws -> T {
+    var lightAnalysisAvailable: Bool {
+        !LLMRouter.resolveCandidates(
+            tier: .light,
+            mode: llmAnalysisMode,
+            primary: settings.primaryCloudEndpoint,
+            light: settings.lightCloudEndpoint,
+            localReady: localLLMReady,
+            lightUseLocalFirst: settings.lightUseLocalFirst
+        ).isEmpty
+    }
+
+    /// 按分级路由器给出的顺序依次尝试可用模型，直到有一次调用成功。
+    func withLLM<T: Sendable>(tier: LLMTier = .primary, _ work: @Sendable (LLMConfig) async throws -> T) async throws -> T {
+        let candidates = LLMRouter.resolveCandidates(
+            tier: tier,
+            mode: llmAnalysisMode,
+            primary: settings.primaryCloudEndpoint,
+            light: settings.lightCloudEndpoint,
+            localReady: localLLMReady,
+            lightUseLocalFirst: settings.lightUseLocalFirst
+        )
         var lastError: Error = AnalyzerError.notConfigured
-        if settings.analysisMode != .local, let cloud = cloudConfig {
-            do { return try await work(cloud) } catch {
-                lastError = error
-                addLog("云端分析模型失败：\(error.localizedDescription)")
-            }
-        }
-        if settings.analysisMode != .cloud, localLLMReady {
-            do {
-                let local = try await LocalLLM.shared.ensureRunning(serverPath: settings.llamaServerPath)
-                return try await work(local)
-            } catch {
-                lastError = error
-                addLog("本机分析模型失败：\(error.localizedDescription)")
+        for candidate in candidates {
+            switch candidate {
+            case .cloud(let endpoint):
+                let config = LLMConfig(baseURL: endpoint.baseURL, model: endpoint.model, key: endpoint.key)
+                do { return try await work(config) } catch {
+                    lastError = error
+                    addLog("云端分析模型失败（\(endpoint.model)）：\(error.localizedDescription)")
+                }
+            case .builtInLocal:
+                do {
+                    let local = try await LocalLLM.shared.ensureRunning(serverPath: settings.llamaServerPath)
+                    return try await work(local)
+                } catch {
+                    lastError = error
+                    addLog("本机分析模型失败：\(error.localizedDescription)")
+                }
             }
         }
         throw lastError
+    }
+
+    func withLLM<T: Sendable>(
+        task: LLMTaskKind,
+        tier: LLMTier? = nil,
+        recordingID: UInt32? = nil,
+        _ work: @Sendable (LLMConfig) async throws -> (T, LLMTokenUsage)
+    ) async throws -> T {
+        let resolvedTier = tier ?? task.defaultTier
+        let outcome = try await withLLM(tier: resolvedTier) { config in
+            let (value, usage) = try await work(config)
+            return LLMWorkOutcome(value: value, usage: usage, config: config)
+        }
+        recordLLMUsage(
+            task: task,
+            tier: resolvedTier,
+            config: outcome.config,
+            recordingID: recordingID,
+            usage: outcome.usage
+        )
+        return outcome.value
     }
 
     /// 转写并整理一条录音。已有文字稿时只重新整理。
@@ -226,8 +283,21 @@ extension BeanStore {
             await QwenASR.shared.stop()
             let profession = settings.profession, duration = rec.duration
             do {
-                result = try await withLLM { config in
-                    try await Analyzer.analyze(transcript: transcript, duration: duration, profession: profession, fixedScene: fixed, config: config)
+                let material = try await Analyzer.prepareAnalysisMaterial(transcript: transcript) { chunkIndex, chunk in
+                    try await self.withLLM(task: .analyzeChunk, tier: .light, recordingID: id) { config in
+                        let res = try await Analyzer.summarizeChunk(index: chunkIndex, chunk: chunk, config: config)
+                        return (res.content, res.usage)
+                    }
+                }
+                result = try await withLLM(task: .analyzeFinal, tier: .primary, recordingID: id) { config in
+                    let res = try await Analyzer.synthesizeDetailed(
+                        material: material,
+                        duration: duration,
+                        profession: profession,
+                        fixedScene: fixed,
+                        config: config
+                    )
+                    return (res.analysis, res.usage)
                 }
             } catch {
                 problem = Problem(title: String(localized: "「\(rec.displayTitle)」没出完整纪要"), detail: String(localized: "分析模型这次没接通，先按关键词粗略分了类。\n原因：\(error.localizedDescription)\n检查一下设置里的分析模型，然后在这条录音上点「重新整理纪要」。"), action: .settings)
@@ -257,19 +327,77 @@ extension BeanStore {
         recordings[j].analyzedBy = result.source
         saveLibrary()
 
-        // 3. 润色：每句出一个去掉语气词、理顺了的版本，原文照旧留着
+        // 3. 润色：按设置决定用规则去语气词、AI 逐句润色，或跳过；原文照旧留着
         let raw = recordings[j].segments
         guard !raw.isEmpty, raw.contains(where: { $0.clean == nil }) else { return }
-        guard result.source != "关键词规则" else {
-            // 没有分析模型时，至少用规则把语气词去掉
-            for n in recordings[j].segments.indices { recordings[j].segments[n].clean = stripFillers(recordings[j].segments[n].text) }
+        switch settings.polishMode {
+        case .off:
+            break
+        case .rules:
+            for n in recordings[j].segments.indices where recordings[j].segments[n].clean == nil {
+                recordings[j].segments[n].clean = stripFillers(recordings[j].segments[n].text)
+            }
             saveLibrary()
+        case .llm:
+            guard result.source != "关键词规则" else {
+                // 没有分析模型时，至少用规则把语气词去掉
+                for n in recordings[j].segments.indices where recordings[j].segments[n].clean == nil {
+                    recordings[j].segments[n].clean = stripFillers(recordings[j].segments[n].text)
+                }
+                saveLibrary()
+                return
+            }
+            if let cleaned = try? await polishSegmentsWithLLM(raw.map(\.text), recordingID: id),
+               let k = index(id), recordings[k].segments.count == cleaned.count {
+                for n in cleaned.indices where !cleaned[n].isEmpty { recordings[k].segments[n].clean = applyVocabulary(cleaned[n]) }
+                saveLibrary()
+            }
+        }
+    }
+
+    private func polishSegmentsWithLLM(_ lines: [String], recordingID: UInt32) async throws -> [String] {
+        var out: [String] = []
+        let batches = stride(from: 0, to: lines.count, by: 30).map { Array(lines[$0..<min($0 + 30, lines.count)]) }
+        for batch in batches {
+            let cleaned = try await withLLM(task: .polish, tier: .light, recordingID: recordingID) { config in
+                try await Analyzer.polishBatch(batch, config: config)
+            }
+            out += cleaned
+        }
+        return out
+    }
+
+    /// 手动对单条录音做一次 AI 逐句润色（走轻量模型层级，仅写入 `segment.clean`，保留原文）。
+    func polishRecording(_ id: UInt32) {
+        guard let rec = recordings.first(where: { $0.id == id }),
+              !rec.segments.isEmpty,
+              !polishing.contains(id) else { return }
+        refreshASRAvailability()
+        guard lightAnalysisAvailable else {
+            problem = Problem(
+                title: String(localized: "还没设置分析模型"),
+                detail: String(localized: "先在设置里配置好分析模型，或者下好本机模型，再点「用 AI 润色文字稿」。"),
+                action: .settings
+            )
             return
         }
-        if let cleaned = try? await withLLM({ config in try await Analyzer.polish(raw.map(\.text), config: config) }),
-           let k = index(id), recordings[k].segments.count == cleaned.count {
-            for n in cleaned.indices where !cleaned[n].isEmpty { recordings[k].segments[n].clean = applyVocabulary(cleaned[n]) }
-            saveLibrary()
+        polishing.insert(id)
+        let lines = rec.segments.map(\.text)
+        Task {
+            defer { polishing.remove(id) }
+            do {
+                await QwenASR.shared.stop()
+                let cleaned = try await polishSegmentsWithLLM(lines, recordingID: id)
+                guard let k = index(id), recordings[k].segments.count == cleaned.count else { return }
+                for n in cleaned.indices where !cleaned[n].isEmpty {
+                    recordings[k].segments[n].clean = applyVocabulary(cleaned[n])
+                }
+                saveLibrary()
+                toast("wand.and.stars", String(localized: "文字稿润色好了"))
+            } catch {
+                problem = Problem(title: String(localized: "没能润色文字稿"), detail: error.localizedDescription)
+            }
+            if worker == nil { await LocalLLM.shared.stop() }
         }
     }
 
@@ -505,8 +633,13 @@ extension BeanStore {
         answerSources = picked.map(\.id)
         Task {
             defer { asking = false }
-            do { answer = try await withLLM { config in try await Analyzer.answer(question: q, context: context, config: config) } }
-            catch { answer = nil; notice = error.localizedDescription }
+            let targetID = picked.count == 1 ? picked[0].id : nil
+            do {
+                answer = try await withLLM(task: .ask, tier: .primary, recordingID: targetID) { config in
+                    let res = try await Analyzer.answerDetailed(question: q, context: context, config: config)
+                    return (res.content, res.usage)
+                }
+            } catch { answer = nil; notice = error.localizedDescription }
             if worker == nil { await LocalLLM.shared.stop() }
         }
     }
@@ -802,8 +935,9 @@ extension BeanStore {
         Task {
             defer { rewriting.remove(id) }
             do {
-                let text = try await withLLM { config in
-                    try await Analyzer.rewrite(material: material, instruction: finalInstruction, profession: profession, config: config)
+                let text = try await withLLM(task: .rewrite, tier: .primary, recordingID: id) { config in
+                    let res = try await Analyzer.rewriteDetailed(material: material, instruction: finalInstruction, profession: profession, config: config)
+                    return (res.content, res.usage)
                 }
                 if let i = recordings.firstIndex(where: { $0.id == id }) {
                     recordings[i].rewrites.insert(Rewrite(name: template == .custom ? String(localized: "自定义") : template.name, text: text), at: 0)

@@ -1528,6 +1528,10 @@ struct RecordingDetail: View {
                     Menu("移到项目") { ProjectMenuItems(ids: [recording.id]) }
                     Divider()
                     Button("重新整理纪要") { store.process(recording.id) }.disabled(recording.transcript == nil)
+                    Button(store.polishing.contains(recording.id) ? "正在用 AI 润色文字稿…" : "用 AI 润色文字稿") {
+                        store.polishRecording(recording.id)
+                    }
+                    .disabled(recording.segments.isEmpty || !store.lightAnalysisAvailable || store.polishing.contains(recording.id) || store.stages[recording.id] != nil)
                     Button("重新转写") { store.process(recording.id, retranscribe: true) }.disabled(recording.textOnly)
                     Button(store.settings.asrConfig == nil ? "交给云端重转（先在设置里配好云端转写）" : "交给云端重转") {
                         store.process(recording.id, retranscribe: true, cloud: true)
@@ -1570,6 +1574,9 @@ struct RecordingDetail: View {
             parts.append(thisYear ? d.formatted(.dateTime.month().day().hour().minute()) : d.formatted(.dateTime.year().month().day().hour().minute()))
         }
         if !recording.textOnly { parts.append(spokenDuration(recording.duration)) }
+        if recording.llmTokens > 0 {
+            parts.append(String(localized: "AI \(LLMUsageLedger.formatTokens(recording.llmTokens)) tokens"))
+        }
         return "•  " + parts.joined(separator: "  •  ")
     }
 
