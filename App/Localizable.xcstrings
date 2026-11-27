@@ -16533,7 +16533,17 @@
           }
         }
       }
+    },
+  "返回人物（⌘←）": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Back to person (⌘←)"
+        }
+      }
     }
+  }
   },
   "version": "1.0"
 }

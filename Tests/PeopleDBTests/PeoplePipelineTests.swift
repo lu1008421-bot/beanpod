@@ -172,4 +172,140 @@ final class PeoplePipelineTests: XCTestCase {
         try db.hideInsight(id: it.id)
         XCTAssertTrue(try db.listInsights(personID: p.id).first?.stale == true)
     }
+
+    // MARK: 第四轮审计回归
+
+    private func utterance(_ rec: UInt32, _ start: Int, _ end: Int, speaker: Int, person: UUID?) -> Utterance {
+        Utterance(id: UUID(), recordingID: rec, audioFingerprint: "recording-\(rec)", startMs: start, endMs: end,
+                  localSpeaker: speaker, overlap: false, personID: person, source: "auto", score: 0.9, modelVersion: "")
+    }
+
+    /// 同一条录音里两个陌生人发言穿插一小时：采纳其中一人的「疑似」只并掉他自己的待认识卡，另一张不动，
+    /// 而且他的发言要转给被认下的人（不能跟着旧卡一起被删）。
+    func testAcceptSuggestionOnlyRemovesOwnPendingCard() throws {
+        let db = try openDB()
+        let rec: UInt32 = 7
+        let known = try db.createPerson(displayName: "老张", status: .confirmed)
+        let a = try db.createPerson(displayName: "", status: .pending)
+        let b = try db.createPerson(displayName: "", status: .pending)
+        var utts: [Utterance] = []
+        for n in 0..<6 {
+            utts.append(utterance(rec, n * 600_000, n * 600_000 + 60_000, speaker: 1, person: a.id))
+            utts.append(utterance(rec, n * 600_000 + 120_000, n * 600_000 + 180_000, speaker: 2, person: b.id))
+        }
+        try db.replaceAutoUtterances(recordingID: rec, utts)
+        XCTAssertEqual(try db.pendingPersonID(recordingID: rec, localSpeaker: 1), a.id)
+        XCTAssertEqual(try db.pendingPersonID(recordingID: rec, localSpeaker: 2), b.id)
+
+        try db.acceptSuggestion(recordingID: rec, localSpeaker: 1, candidateID: known.id)
+
+        XCTAssertNil(try db.person(id: a.id), "被认下的那个声音自己的待认识卡并掉")
+        XCTAssertEqual(try db.person(id: b.id)?.status, .pending, "另一个人的待认识卡不能被误删")
+        let mine = try db.listUtterancesForPerson(personID: known.id)
+        XCTAssertEqual(mine.count, 6, "这个声音的发言全部转给被认下的人")
+        XCTAssertTrue(mine.allSatisfy { $0.recordingID == rec && $0.localSpeaker == 1 })
+        XCTAssertEqual(try db.listUtterancesForPerson(personID: b.id).count, 6)
+        XCTAssertNil(try db.pendingPersonID(recordingID: rec, localSpeaker: 1))
+        XCTAssertEqual(try db.pendingPersonID(recordingID: rec, localSpeaker: 2), b.id)
+    }
+
+    /// 这个声音没有待认识卡（比如场景拦截没建卡）时，采纳只是把未归属的发言归过去。
+    func testAcceptSuggestionWithoutPendingCardAssignsUnownedUtterances() throws {
+        let db = try openDB()
+        let rec: UInt32 = 8
+        let known = try db.createPerson(displayName: "老李", status: .confirmed)
+        try db.replaceAutoUtterances(recordingID: rec, [utterance(rec, 0, 4000, speaker: 0, person: nil),
+                                                        utterance(rec, 9000, 12000, speaker: 0, person: nil),
+                                                        utterance(rec, 5000, 8000, speaker: 1, person: nil)])
+        try db.acceptSuggestion(recordingID: rec, localSpeaker: 0, candidateID: known.id)
+        let mine = try db.listUtterancesForPerson(personID: known.id)
+        XCTAssertEqual(mine.map(\.startMs), [0, 9000])
+    }
+
+    /// 代表原声是几句各自连续的话（最长的至多 3 段），不是从第一次开口到最后一次的整条。
+    func testRepresentativeClipsAreSeparateSegments() {
+        let v = [Float(1)]
+        // 第 0 秒、第 300 秒、第 350 秒各说了几句：一个人在录音里前后穿插
+        let clips = StrangerClips.representative([(start: 0, end: 10, vector: v), (start: 300, end: 310, vector: v),
+                                                 (start: 350, end: 359.5, vector: v), (start: 350, end: 355, vector: v)])
+        XCTAssertEqual(clips.count, 3)
+        XCTAssertEqual(clips.map(\.seconds), [10, 10, 9.5])
+        XCTAssertEqual(clips.map(\.startMs), [0, 300_000, 350_000])
+        XCTAssertTrue(clips.allSatisfy { $0.seconds <= 10 }, "每段都不超过单句时长，不能跨成一小时")
+        // 按时长降序；不足 3 段就有几段给几段
+        XCTAssertEqual(StrangerClips.representative([(start: 5, end: 7, vector: v)]).first?.startMs, 5000)
+        XCTAssertTrue(StrangerClips.representative([(start: 5, end: 5, vector: v)]).isEmpty, "零长度的不算")
+    }
+
+    /// 「听一段」：不循环也要记下正在听的区间；停、播到句尾、跳出区间都会清掉。
+    func testSpanPlaybackTracksActiveSpan() {
+        var p = SpanPlayback()
+        XCTAssertNil(p.activeSpan)
+        p.begin(10...20, loop: false, duration: 100)
+        XCTAssertEqual(p.activeSpan, 10...20)
+        XCTAssertEqual(p.stopAt, 20, "不循环：播到句尾停")
+        p.clear()                                   // stop()
+        XCTAssertNil(p.activeSpan)
+        XCTAssertNil(p.stopAt)
+
+        p.begin(10...20, loop: true, duration: 100)
+        XCTAssertEqual(p.activeSpan, 10...20, "循环也记 activeSpan，界面才知道这一行正在播")
+        XCTAssertNil(p.stopAt)
+        p.leaveIfOutside(at: 15)
+        XCTAssertEqual(p.activeSpan, 10...20, "还在这一段里：不变")
+        p.leaveIfOutside(at: 30)                    // play(_:at:) 跳出去了
+        XCTAssertNil(p.activeSpan)
+        XCTAssertNil(p.stopAt)
+
+        // 录音结尾留余量；太短的段落至少播 0.3 秒
+        p.begin(98...120, loop: false, duration: 100)
+        XCTAssertEqual(p.activeSpan, 98...99.85)
+        XCTAssertEqual(p.stopAt, 99.85)
+        p.begin(5...5.1, loop: false, duration: 100)
+        XCTAssertEqual(p.activeSpan, 5...5.3)
+    }
+
+    /// 路径 B：老文字稿只有开头时间，句尾用下一句的开头、最后一句用到录音结束，然后按中点归人。
+    func testPathBFillsMissingEndsBeforeAligning() {
+        let spans = SpeakerAlignment.withEnds([(start: 0, end: nil), (start: 3, end: nil), (start: 7.5, end: nil)], duration: 12)
+        XCTAssertEqual(spans, [span(0, 3), span(3, 7.5), span(7.5, 12)])
+        let runs = [(span(0, 4), 0), (span(4, 12), 1)]
+        XCTAssertEqual(SpeakerAlignment.segmentSpeakers(segments: spans, runs: runs), [0, 1, 1])
+        // 有句尾的照用；录音时长比最后一句开头还小（时长没算准）也不出倒挂区间
+        XCTAssertEqual(SpeakerAlignment.withEnds([(start: 0, end: 2.5), (start: 3, end: nil)], duration: 1),
+                       [span(0, 2.5), span(3, 3.01)])
+        // 仍然只有一段 start=0 时不整篇归人
+        let single = SpeakerAlignment.withEnds([(start: 0, end: nil)], duration: 9)
+        XCTAssertEqual(SpeakerAlignment.segmentSpeakers(segments: single, runs: runs), [nil])
+    }
+
+    /// 分窗的结尾重叠区：上一窗被窗尾截出来的半句，下一窗里有同一个人更完整的区间时只留下一窗那份。
+    func testWindowTailOverlapBelongsToNextWindow() {
+        func first(_ next: [WindowLinker.Turn]) -> [WindowLinker.Turn] {
+            WindowLinker.merge([
+                WindowLinker.Window(turns: [.init(start: 10, end: 20, speaker: 0), .init(start: 272, end: 285, speaker: 0),
+                                            .init(start: 299.6, end: 299.96, speaker: 1)],
+                                    centroids: [0: unit(0), 1: unit(1)], keepFrom: 0, cutAt: 300),
+                WindowLinker.Window(turns: next, centroids: [0: unit(1), 1: unit(0)], keepFrom: 300),
+            ], cosine: SpeakerMatcher.cosine)
+        }
+        let turns = first([.init(start: 272, end: 285, speaker: 1), .init(start: 299.6, end: 306, speaker: 0)])
+        XCTAssertEqual(turns.map(\.speaker), [0, 0, 1])
+        XCTAssertEqual(turns.map(\.start), [10, 272, 299.6], "窗尾截出的 299.6–299.96 那半句不重复")
+        XCTAssertEqual(turns.last?.end, 306, "取下一窗看到的整句")
+        // 下一窗没分出这句（比如静音被并掉了）：截出来的半句照留，不能丢
+        let kept = first([.init(start: 272, end: 285, speaker: 1)])
+        XCTAssertEqual(kept.map(\.end), [20, 285, 299.96])
+        // 下一窗里重叠的是别人：也不删（各是各的话）
+        let other = first([.init(start: 272, end: 285, speaker: 1), .init(start: 299.6, end: 306, speaker: 1)])
+        XCTAssertEqual(other.map(\.speaker), [0, 0, 1, 0], "半句和下一窗那句是两个人说的：都留")
+    }
+
+    /// 没有分析模型时：短于 90 秒、判不出场景的录音默认当「灵感」；但分人已听出两个以上的人在说话就不是。
+    func testShortMultiSpeakerRecordingIsNotMemo() {
+        XCTAssertTrue(FallbackSceneRule.looksLikeMemo(duration: 53, localSpeakers: 0), "没分过人：维持原来的兜底")
+        XCTAssertTrue(FallbackSceneRule.looksLikeMemo(duration: 53, localSpeakers: 1), "一个人自言自语")
+        XCTAssertFalse(FallbackSceneRule.looksLikeMemo(duration: 53, localSpeakers: 2), "多人短对话不拦")
+        XCTAssertFalse(FallbackSceneRule.looksLikeMemo(duration: 200, localSpeakers: 0), "长录音本来就不兜底")
+    }
 }

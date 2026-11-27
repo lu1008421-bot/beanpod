@@ -106,7 +106,9 @@ struct PeopleView: View {
             Divider().overlay(Theme.warm200.opacity(0.6))
 
             if confirmed.isEmpty, pending.isEmpty {
+                // 一个人都没有时「我的声音」也要在：只有「我」这张卡时列表同样会走到这里
                 emptyHint
+                ScrollView { VStack(alignment: .leading, spacing: 4) { meRow }.padding(.vertical, 8) }
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
@@ -338,11 +340,11 @@ struct PeopleView: View {
         guard let rid = s.recordingID else { return AnyView(EmptyView()) }
         let start = Double(s.startMs) / 1000
         let end = min(Double(s.endMs) / 1000, start + 8)
-        let on = store.isPlaying && store.playingID == rid && (store.loopSpan.map { abs($0.lowerBound - start) < 0.01 } ?? false)
+        let on = store.activeSpan.map { abs($0.lowerBound - start) < 0.01 } ?? false
         let title = store.recordings.first(where: { $0.id == rid })?.displayTitle ?? ""
         return AnyView(
             HStack(spacing: 10) {
-                Button { if on { store.stop() } else { store.playSpan(rid, start...max(start + 0.3, end), loop: false) } } label: {
+                Button { if on { store.stop() } else { store.playSpan(rid, start...end, loop: false) } } label: {
                     Label(on ? "停" : "听", systemImage: on ? "stop.circle.fill" : "play.circle.fill")
                         .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.accent)
                         .padding(.horizontal, 10).padding(.vertical, 4)
@@ -367,16 +369,17 @@ struct PeopleView: View {
                 ForEach(suggestions(for: p)) { s in
                     let title = store.recordings.first(where: { $0.id == s.recordingID })?.displayTitle ?? ""
                     let start = Double(s.startMs) / 1000
+                    let playingThis = store.activeSpan.map { abs($0.lowerBound - start) < 0.01 } ?? false
                     HStack(spacing: 10) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("有一段声音疑似 TA（相似度 \(Int((s.score * 100).rounded()))%）").font(.callout)
                             Text(title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer(minLength: 0)
-                        Button { store.playSpan(s.recordingID, start...max(start + 0.3, min(Double(s.endMs) / 1000, start + 8)), loop: false) } label: {
-                            Image(systemName: "play.circle").font(.system(size: 15))
+                        Button { if playingThis { store.stop() } else { store.playSpan(s.recordingID, start...min(Double(s.endMs) / 1000, start + 8), loop: false) } } label: {
+                            Image(systemName: playingThis ? "stop.circle.fill" : "play.circle").font(.system(size: 15))
                         }
-                        .buttonStyle(.bordered).help("听一听")
+                        .buttonStyle(.bordered).help(playingThis ? "停" : "听一听")
                         Button("就是 TA") { store.acceptSuggestion(s) }.buttonStyle(.glassProminent).tint(Theme.accent)
                         Button("不是") { store.rejectSuggestion(s) }.buttonStyle(.bordered)
                     }
@@ -592,7 +595,7 @@ struct PeopleView: View {
     guard let rid = s.recordingID else { return (false, {}) }
     let start = Double(s.startMs) / 1000
     let end = Double(max(s.startMs + 300, s.endMs)) / 1000
-    let playing = store.isPlaying && store.playingID == rid && (store.loopSpan.map { abs($0.lowerBound - start) < 0.01 } ?? false)
+    let playing = store.activeSpan.map { abs($0.lowerBound - start) < 0.01 } ?? false
     return (playing, { playing ? store.stop() : store.playSpan(rid, start...end, loop: false) })
     }()
     return HStack(spacing: 10) {
@@ -600,7 +603,7 @@ struct PeopleView: View {
     Image(systemName: on ? "pause.circle.fill" : "play.circle.fill")
     .font(.system(size: 16)).foregroundStyle(Theme.accent)
     }
-    .buttonStyle(.plain).help(on ? "暂停" : "试听这段")
+    .buttonStyle(.plain).help(on ? "停" : "试听这段")
     VStack(alignment: .leading, spacing: 2) {
     Text("\(s.channel == .speakerLoopback ? "外放" : "近场") · \(msLabel(s))\(s.confirmed ? "" : " · 未确认")").font(.callout)
     if s.sourceKind == .importedFile {
