@@ -70,6 +70,13 @@ final class FeishuSync {
     private weak var store: BeanStore?
     private var tool: String?
     private var loop: Task<Void, Never>?
+    private var fillingAudio = false
+    private var audioSkipped: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "feishuAudioSkipped") ?? []) {
+        didSet { UserDefaults.standard.set(Array(audioSkipped), forKey: "feishuAudioSkipped") }
+    }
+    private var audioScopeRetryAt: Date? = UserDefaults.standard.object(forKey: "feishuAudioScopeRetryAt") as? Date {
+        didSet { UserDefaults.standard.set(audioScopeRetryAt, forKey: "feishuAudioScopeRetryAt") }
+    }
 
     func link(for id: UInt32) -> URL? { links[String(id)].flatMap(URL.init(string:)) }
 
@@ -162,7 +169,7 @@ final class FeishuSync {
         lastChecked = .now
         link = .ready
         // 以前只拉回了文字稿的，现在有音频权限就补上
-        if autoPull, !textOnlyImports.isEmpty { await fillAudio() }
+        if autoPull { await fillAudio(automatic: true) }
         let fresh = newOnes
         // 新的默认勾上——只勾最近一天传上去的；更早的（比如几天前的会议）列着，要的话自己勾，免得第一次一下拉回几十条
         let recent = Date.now.addingTimeInterval(-86_400)
@@ -238,22 +245,43 @@ final class FeishuSync {
         imported.values.filter { id in store?.recordings.contains { $0.id == id && $0.textOnly } == true }
     }
 
-    func fillAudio() async {
-        guard let tool, let store, !textOnlyImports.isEmpty else { return }
+    func fillAudio(automatic: Bool = false) async {
+        guard !BeanStore.demo, !fillingAudio, let tool, let store else { return }
+        let eligible = Set(textOnlyImports)
+        guard !eligible.isEmpty else { return }
+        if automatic, let audioScopeRetryAt, audioScopeRetryAt > .now {
+            audioDenied = true
+            return
+        }
+        fillingAudio = true
+        defer { fillingAudio = false }
+
         var done = 0
-        for (token, id) in imported where textOnlyImports.contains(id) {
+        for (token, id) in imported where eligible.contains(id) {
+            if automatic, audioSkipped.contains(token) { continue }
+            guard store.stages[id] == nil, store.recordings.contains(where: { $0.id == id && $0.textOnly }) else { continue }
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("feishu-audio-\(token)", isDirectory: true)
             try? FileManager.default.removeItem(at: dir)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: dir) }
             let dl = await BeanStore.runTool(tool, ["minutes", "+download", "--minute-tokens", token, "--output-dir", ".", "--overwrite", "--format", "json"], cwd: dir) { _ in }
             if let err = Self.reply(dl)?["error"] as? [String: Any] {
-                if (err["subtype"] as? String) == "missing_scope" { audioDenied = true; return }
-                store.addLog("飞书妙记 \(token) 补音频失败：\(err["message"] as? String ?? "")")
+                if (err["subtype"] as? String) == "missing_scope" {
+                    audioDenied = true
+                    audioScopeRetryAt = .now.addingTimeInterval(24 * 60 * 60)
+                    break
+                }
+                let message = err["message"] as? String ?? ""
+                let permanent = message.localizedCaseInsensitiveContains("user lacks permission") ||
+                    message.localizedCaseInsensitiveContains("blocked download URL")
+                if permanent { audioSkipped.insert(token) }
+                store.addLog("飞书妙记 \(token) 补音频失败：\(message)")
                 continue
             }
             guard let audio = Self.firstFile(in: dir, ext: ["m4a", "mp3", "mp4", "aac", "wav", "ogg", "webm", "opus", "mov"]) else { continue }
             audioDenied = false
+            audioScopeRetryAt = nil
+            if audioSkipped.contains(token) { audioSkipped.remove(token) }
             if await store.attachFeishuAudio(audio, to: id) { done += 1 }
         }
         if done > 0 { store.announce("waveform", String(localized: "给 \(done) 条飞书录音补上了音频"), body: String(localized: "正在重新转写，转完就能点句子回听。")) }
