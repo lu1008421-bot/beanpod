@@ -132,13 +132,13 @@ extension BeanStore {
             (order.firstIndex { a.lastPathComponent.contains(".\($0).") } ?? 99) < (order.firstIndex { b.lastPathComponent.contains(".\($0).") } ?? 99)
         }
         let cues = best.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(SubtitleParser.parse) ?? []
-        finishLinkImport(id, audio: audio, title: title, author: author, page: page, platform: platform, cues: cues, fetchVideo: true)
+        await finishLinkImport(id, audio: audio, title: title, author: author, page: page, platform: platform, cues: cues, fetchVideo: true)
     }
 
     /// 声音拿到之后：放进录音库，标好来源，交给整理。
     /// video：手上已有的视频文件（按规则决定留不留画面）；fetchVideo：只下了声音，要留画面时另外去下一份（yt-dlp 那一路）。
     func finishLinkImport(_ id: UUID, audio: URL, title: String, author: String, page: String, platform: String, cues: [SubtitleParser.Cue],
-                          video: URL? = nil, fetchVideo: Bool = false) {
+                          video: URL? = nil, fetchVideo: Bool = false) async {
         if let k = linkJobs.firstIndex(where: { $0.id == id }) { linkJobs[k].title = title; linkJobs[k].progress = 1 }
         // 贴的是短链时，导入前认不出是哪条；解析出作品页后再查一次，导入过的不再放一份
         if let old = importedRecording(for: page) {
@@ -146,13 +146,11 @@ extension BeanStore {
             toast("checkmark.circle", String(localized: "导入过了，在素材里：\(String((old.title ?? title).prefix(18)))"))
             return
         }
-        let before = Set(recordings.map(\.id))
-        importFile(audio, consume: true, processNow: false)
-        guard let k = recordings.firstIndex(where: { !before.contains($0.id) }) else {
+        guard let rid = await importFileAsync(audio, consume: true, processNow: false),
+              let k = recordings.firstIndex(where: { $0.id == rid }) else {
             problem = Problem(title: String(localized: "这条\(platform)链接没能导入"), detail: String(localized: "声音下下来了，但豆仓读不出这个音频文件。"))
             return
         }
-        let rid = recordings[k].id
         recordings[k].title = title.isEmpty ? nil : String(title.prefix(80))
         recordings[k].titleEdited = !title.isEmpty        // 原作者起的标题留着，整理时不换
         recordings[k].origin = author.isEmpty ? platform : "\(platform) · @\(author)"
@@ -678,8 +676,8 @@ extension BeanStore {
         if let k = linkJobs.firstIndex(where: { $0.id == id }) { linkJobs[k].progress = 0.8 }
 
         let audio = await audioTrack(of: media, in: work) ?? media
-        finishLinkImport(id, audio: audio, title: found.title, author: found.author,
-                         page: "https://www.douyin.com/video/\(found.awemeId)", platform: "抖音", cues: [], video: media)
+        await finishLinkImport(id, audio: audio, title: found.title, author: found.author,
+                               page: "https://www.douyin.com/video/\(found.awemeId)", platform: "抖音", cues: [], video: media)
         return true
     }
 }

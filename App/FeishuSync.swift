@@ -1,3 +1,4 @@
+import BeanKit
 import Foundation
 import SwiftUI
 
@@ -356,16 +357,28 @@ extension BeanStore {
     private func feishuTitle(_ m: FeishuSync.Minute) -> String? { m.recorded == nil ? m.title : nil }
 
     func importFeishuAudio(_ file: URL, minute m: FeishuSync.Minute) async -> UInt32? {
-        let samples = await Task.detached { BeanStore.decodeAnyAudio(file) }.value
-        guard let samples, samples.count > 1600 else { addLog("飞书妙记 \(m.id) 的音频解不开"); return nil }
-        let id = freshID(near: m.start)
-        do { try QwenASR.wav(samples).write(to: wavURL(id), options: .atomic) } catch { addLog("飞书妙记写不进磁盘：\(error.localizedDescription)"); return nil }
-        var rec = Recording(id: id, size: UInt32(samples.count * 2), date: m.start, duration: Double(samples.count) / 16000)
-        rec.downloaded = true; rec.origin = Self.feishuOrigin; rec.title = feishuTitle(m)
-        insertImported(rec)
-        addLog("从飞书妙记拉回音频 \(m.id) → \(id)")
-        if settings.autoProcess { process(id) }
-        return id
+        let id = allocateRecordingID(near: m.start)
+        defer { reservedImportIDs.remove(id) }
+        let dest = wavURL(id)
+        do {
+            let result = try await Task.detached(priority: .userInitiated) {
+                try AudioStream.transcodeToMono16kWAV(from: file, to: dest, minSamples: 1601)
+            }.value
+            var rec = Recording(id: id, size: UInt32(clamping: result.byteSize), date: m.start, duration: result.duration)
+            rec.downloaded = true; rec.origin = Self.feishuOrigin; rec.title = feishuTitle(m)
+            insertImported(rec)
+            addLog("从飞书妙记拉回音频 \(m.id) → \(id)")
+            if settings.autoProcess { process(id) }
+            return id
+        } catch AudioStreamError.unreadable, AudioStreamError.tooShort {
+            try? FileManager.default.removeItem(at: dest)
+            addLog("飞书妙记 \(m.id) 的音频解不开")
+            return nil
+        } catch {
+            try? FileManager.default.removeItem(at: dest)
+            addLog("飞书妙记写不进磁盘：\(error.localizedDescription)")
+            return nil
+        }
     }
 
     func importFeishuText(_ text: String, minute m: FeishuSync.Minute) -> UInt32? {
@@ -385,14 +398,31 @@ extension BeanStore {
 
     /// 给只有文字稿的飞书录音补上音频：写 wav、不再是纯文字，重新转写（纪要、标题、标签照常更新）。
     func attachFeishuAudio(_ file: URL, to id: UInt32) async -> Bool {
-        let samples = await Task.detached { BeanStore.decodeAnyAudio(file) }.value
         // 正在处理（转写或整理）的先不动：process 会因为它在队列里直接返回，补上的音频就没被转写，以后也不会再补
         guard stages[id] == nil else { addLog("飞书录音 \(id) 正在处理，等处理完再补音频"); return false }
-        guard let samples, samples.count > 1600, let i = recordings.firstIndex(where: { $0.id == id }) else { return false }
-        do { try QwenASR.wav(samples).write(to: wavURL(id), options: .atomic) } catch { return false }
+        guard recordings.contains(where: { $0.id == id }) else { return false }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("beanpod-feishu-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let result: WAVWriteResult
+        do {
+            result = try await Task.detached(priority: .userInitiated) {
+                try AudioStream.transcodeToMono16kWAV(from: file, to: tmp, minSamples: 1601)
+            }.value
+        } catch {
+            return false
+        }
+        guard stages[id] == nil, let i = recordings.firstIndex(where: { $0.id == id }) else { return false }
+        let dest = wavURL(id)
+        do {
+            if FileManager.default.fileExists(atPath: dest.path) {
+                _ = try FileManager.default.replaceItemAt(dest, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: dest)
+            }
+        } catch { return false }
         recordings[i].textOnly = false
-        recordings[i].duration = Double(samples.count) / 16000
-        recordings[i].size = UInt32(samples.count * 2)
+        recordings[i].duration = result.duration
+        recordings[i].size = UInt32(clamping: result.byteSize)
         saveLibrary()
         addLog("飞书录音 \(id) 补上音频，重新转写")
         process(id, retranscribe: true)

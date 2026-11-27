@@ -141,7 +141,22 @@ extension BeanStore {
             do {
                 let segments: [Segment], engine: String
                 refreshASRAvailability()
-                if settings.engine == .cloud || viaCloud.contains(id), let asr = settings.asrConfig {
+                let preferred: ASRPreferredEngine = switch settings.engine {
+                case .qwen: .qwen
+                case .apple: .apple
+                case .cloud: .cloud
+                }
+                let decision = ASRRoutePolicy.resolve(
+                    preferred: preferred,
+                    forceCloud: viaCloud.contains(id),
+                    hasCloudConfig: settings.asrConfig != nil,
+                    hasQwenServer: QwenASR.locateServer(custom: settings.llamaServerPath) != nil,
+                    hasQwenModel: QwenASR.locateModel() != nil,
+                    retranscribing: retranscribing.contains(id)
+                )
+                switch decision {
+                case .cloud:
+                    guard let asr = settings.asrConfig else { return }
                     // 云端转写：录音会发给用户自己填的那家服务商
                     segments = try await CloudASR.transcribe(wavURL(id), config: asr, language: settings.language) { fraction in
                         Task { @MainActor [weak self] in
@@ -149,17 +164,31 @@ extension BeanStore {
                         }
                     }
                     engine = "云端 · \(asr.model)"
-                } else if settings.engine == .qwen, asrAvailable {
+                case .qwen:
                     segments = try await QwenASR.shared.transcribe(wavURL(id), serverPath: settings.llamaServerPath) { fraction in
                         Task { @MainActor [weak self] in
                             if case .transcribing = self?.stages[id] { self?.stages[id] = .transcribing(fraction) }
                         }
                     }
                     engine = QwenASR.displayName
-                } else {
+                case .apple:
                     let text = try await Transcriber.transcribe(wavURL(id), language: settings.language)
                     segments = text.isEmpty ? [] : [Segment(start: 0, text: text)]
                     engine = "系统语音识别"
+                case .appleDegraded(let reason):
+                    let text = try await Transcriber.transcribe(wavURL(id), language: settings.language)
+                    segments = text.isEmpty ? [] : [Segment(start: 0, text: text)]
+                    engine = "系统语音识别（降级）"
+                    addLog("转写降级为系统语音识别：\(reason)")
+                    problem = Problem(
+                        title: String(localized: "已临时降级为系统语音识别"),
+                        detail: String(localized: "\(reason)，本次转写没有逐句时间戳。可以在设置里补齐 Qwen3‑ASR 后，在这条录音上点「重新转写」。"),
+                        action: .settings
+                    )
+                case .blocked(let title, let detail):
+                    problem = Problem(title: title, detail: detail, action: .settings)
+                    addLog("转写中止：\(title)（\(detail)）")
+                    return
                 }
                 guard let i = index(id) else { return }
                 recordings[i].segments = segments.map { Segment(start: $0.start, text: applyVocabulary($0.text)) }
@@ -750,15 +779,9 @@ extension BeanStore {
         }
     }
 
-    /// 给已经录好的录音算一条波形，用在播放条上。
+    /// 给已经录好的录音算一条波形，用在播放条上（分块扫描并带缓存）。
     nonisolated static func waveform(of url: URL, bars: Int = 160) -> [Float] {
-        guard let samples = try? QwenASR.loadMono16k(url), samples.count > bars else { return [] }
-        let step = samples.count / bars
-        return (0..<bars).map { b in
-            var peak: Float = 0
-            for j in stride(from: b * step, to: (b + 1) * step, by: 8) { peak = max(peak, abs(samples[j])) }
-            return min(1, peak.squareRoot() * 1.4)
-        }
+        AudioStream.waveform(of: url, bars: bars)
     }
 
     // MARK: 改写
@@ -988,50 +1011,101 @@ extension BeanStore {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: inboxFolder, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
         for file in files where !file.lastPathComponent.hasPrefix(".") {
-            // 还在写入的文件先不碰：两秒内改过的等下一轮
+            // 还在写入或正在后台导入的文件先不碰：两秒内改过的等下一轮
+            guard !importingFiles.contains(file.standardizedFileURL.path) else { continue }
             let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             guard Date.now.timeIntervalSince(modified) > 2, !file.hasDirectoryPath else { continue }
             importFile(file)
         }
     }
 
+    func allocateRecordingID(near date: Date = .now) -> UInt32 {
+        var id = UInt32(max(0, date.timeIntervalSince1970))
+        while recordings.contains(where: { $0.id == id })
+            || trash.contains(where: { $0.recording.id == id })
+            || reservedImportIDs.contains(id) {
+            id += 1
+        }
+        reservedImportIDs.insert(id)
+        return id
+    }
+
     /// consume：处理完把原文件删掉。收件箱里的文件是这样；用户自己选的文件不动它。
-    func importFile(_ file: URL, consume: Bool = true, processNow: Bool = true) {
-        let fm = FileManager.default
-        var id = UInt32(Date.now.timeIntervalSince1970)
-        while recordings.contains(where: { $0.id == id }) { id += 1 }
+    func importFile(_ file: URL, consume: Bool = true, processNow: Bool = true, securityScoped: Bool = false) {
+        let granted = securityScoped ? file.startAccessingSecurityScopedResource() : false
+        Task {
+            defer { if granted { file.stopAccessingSecurityScopedResource() } }
+            _ = await self.importFileAsync(file, consume: consume, processNow: processNow)
+        }
+    }
+
+    @discardableResult
+    func importFileAsync(_ file: URL, consume: Bool = true, processNow: Bool = true) async -> UInt32? {
+        let key = file.standardizedFileURL.path
+        guard importingFiles.insert(key).inserted else { return nil }
+        importingCount += 1
+        defer {
+            importingFiles.remove(key)
+            importingCount = max(0, importingCount - 1)
+        }
+
         let ext = file.pathExtension.lowercased()
         // 文件名前面的「时间戳-」是命令行加的防重名前缀，标题里不要
         var name = file.deletingPathExtension().lastPathComponent
         if let dash = name.firstIndex(of: "-"), name[..<dash].allSatisfy(\.isNumber) { name = String(name[name.index(after: dash)...]) }
 
         if ["md", "txt"].contains(ext) {
-            guard var text = try? String(contentsOf: file, encoding: .utf8) else { reject(file, String(localized: "读不出文字"), consume); return }
+            let rawText: String? = await Task.detached(priority: .userInitiated) {
+                try? String(contentsOf: file, encoding: .utf8)
+            }.value
+            guard var text = rawText else { reject(file, String(localized: "读不出文字"), consume); return nil }
             var title: String?
             if text.hasPrefix("# "), let end = text.firstIndex(of: "\n") {
                 title = String(text[text.index(text.startIndex, offsetBy: 2)..<end]).trimmingCharacters(in: .whitespaces)
                 text = String(text[end...])
             }
             text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { reject(file, String(localized: "内容是空的"), consume); return }
+            guard !text.isEmpty else { reject(file, String(localized: "内容是空的"), consume); return nil }
+            let id = allocateRecordingID()
+            defer { reservedImportIDs.remove(id) }
             var rec = Recording(id: id, size: UInt32(text.utf8.count), date: .now, duration: 0)
             rec.downloaded = true; rec.textOnly = true; rec.origin = "文字笔记"
             rec.title = title; rec.transcript = text; rec.transcribedBy = "外部文字"
             recordings.insert(rec, at: 0)
-            if consume { try? fm.removeItem(at: file) }
+            if consume { try? FileManager.default.removeItem(at: file) }
             addLog("导入文字笔记 \(id)")
-        } else {
-            let source = file
-            guard let samples = Self.decodeAnyAudio(source), samples.count > 1600 else { reject(file, String(localized: "不是能识别的音频"), consume); return }
-            do { try QwenASR.wav(samples).write(to: wavURL(id), options: .atomic) } catch { reject(file, String(localized: "写不进磁盘"), consume); return }
-            var rec = Recording(id: id, size: UInt32(samples.count * 2), date: .now, duration: Double(samples.count) / 16000)
+            saveLibrary()
+            if processNow { process(id) }
+            return id
+        }
+
+        let id = allocateRecordingID()
+        defer { reservedImportIDs.remove(id) }
+        let dest = wavURL(id)
+        if !consume {
+            toast("arrow.down.doc", String(localized: "正在后台导入「\(file.lastPathComponent)」…"))
+        }
+        do {
+            let result = try await Task.detached(priority: .userInitiated) {
+                try AudioStream.transcodeToMono16kWAV(from: file, to: dest, minSamples: 1601)
+            }.value
+            var rec = Recording(id: id, size: UInt32(clamping: result.byteSize), date: .now, duration: result.duration)
             rec.downloaded = true; rec.origin = "导入的音频"; rec.title = name
             recordings.insert(rec, at: 0)
-            if consume { try? fm.removeItem(at: file) }
+            if consume { try? FileManager.default.removeItem(at: file) }
             addLog("导入音频 \(file.lastPathComponent) → \(id)")
+            saveLibrary()
+            if processNow, settings.autoProcess { process(id) }
+            return id
+        } catch AudioStreamError.writeFailed, AudioStreamError.wavTooLarge {
+            try? FileManager.default.removeItem(at: dest)
+            reject(file, String(localized: "写不进磁盘"), consume)
+            return nil
+        } catch {
+            try? FileManager.default.removeItem(at: dest)
+            reject(file, String(localized: "不是能识别的音频"), consume)
+            return nil
         }
-        saveLibrary()
-        if processNow, settings.autoProcess || recordings.first?.textOnly == true { process(id) }
     }
 
     /// 处理不了的文件挪到「没能导入」里，不删，也不反复重试。

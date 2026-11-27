@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import BeanKit
 import Foundation
 
 /// 云端转写要连的服务。
@@ -43,21 +44,17 @@ nonisolated enum CloudASR {
 
     static func transcribe(_ url: URL, config: ASRConfig, language: String,
                            progress: @Sendable @escaping (Double) -> Void) async throws -> [Segment] {
-        let samples = try QwenASR.loadMono16k(url)
-        // 先沿着安静的地方切成小段，再把相邻的小段并成不超过五分钟的一批，这样不会把一句话切在两批中间
-        var batches: [Range<Int>] = []
-        for piece in QwenASR.chunk(samples) {
-            if let last = batches.last, piece.upperBound - last.lowerBound <= batchSeconds * 16000 {
-                batches[batches.count - 1] = last.lowerBound..<piece.upperBound
-            } else {
-                batches.append(piece)
-            }
-        }
+        let reader = try Mono16kStreamReader(url: url)
+        let rate = AudioStream.sampleRate
+        let batchLimit = batchSeconds * rate
+        let totalEstimated = max(1, reader.estimatedTotalFrames)
+        var buffer: [Float] = []
+        var processedFrames = 0
         var out: [Segment] = []
         var plain = false   // 这家不认压缩格式或带时间戳的返回时，退回最朴素的请求
-        for (n, range) in batches.enumerated() {
-            let piece = Array(samples[range])
-            let offset = Double(range.lowerBound) / 16000
+
+        func sendBatch(_ piece: [Float], offsetSamples: Int) async throws {
+            let offset = Double(offsetSamples) / Double(rate)
             var segments: [Segment]
             do {
                 segments = try await request(piece, config: config, language: language, rich: !plain)
@@ -66,8 +63,31 @@ nonisolated enum CloudASR {
                 segments = try await request(piece, config: config, language: language, rich: false)
             }
             out += segments.map { Segment(start: $0.start + offset, text: $0.text) }
-            progress(Double(n + 1) / Double(batches.count))
         }
+
+        while true {
+            try Task.checkCancellation()
+            while buffer.count <= batchLimit && !reader.isAtEnd {
+                let next = try reader.readNext()
+                if next.isEmpty { break }
+                buffer.append(contentsOf: next)
+            }
+            if buffer.count > batchLimit {
+                let cut = AudioStream.nextBatchCut(in: buffer, maxBatchSamples: batchLimit, rate: rate)
+                let piece = Array(buffer[..<cut])
+                buffer.removeFirst(cut)
+                try await sendBatch(piece, offsetSamples: processedFrames)
+                processedFrames += cut
+                progress(min(0.99, Double(processedFrames) / Double(totalEstimated)))
+            } else if reader.isAtEnd {
+                if buffer.count > rate / 4 {
+                    try await sendBatch(buffer, offsetSamples: processedFrames)
+                    processedFrames += buffer.count
+                }
+                break
+            }
+        }
+        progress(1)
         return out.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 

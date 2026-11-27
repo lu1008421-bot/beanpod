@@ -70,9 +70,9 @@ extension BeanStore {
         let audio = await audioTrack(of: media, in: work) ?? media
         // 抖音的分享短链会过期，记下作品页的正式地址
         let douyinId = platform == "抖音" ? (result["id"] as? String ?? "") : ""
-        finishLinkImport(id, audio: audio, title: title, author: author,
-                         page: douyinId.isEmpty ? url : "https://www.douyin.com/video/\(douyinId)",
-                         platform: platform, cues: [], video: media)
+        await finishLinkImport(id, audio: audio, title: title, author: author,
+                               page: douyinId.isEmpty ? url : "https://www.douyin.com/video/\(douyinId)",
+                               platform: platform, cues: [], video: media)
         return true
     }
 
