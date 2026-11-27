@@ -116,9 +116,7 @@ struct RecordingsScreen: View {
             .fileImporter(isPresented: $importing, allowedContentTypes: [.audio, .movie, .plainText, .text], allowsMultipleSelection: true) { result in
                 guard case .success(let urls) = result else { return }
                 for url in urls {
-                    let scoped = url.startAccessingSecurityScopedResource()
-                    store.importFile(url, consume: false)
-                    if scoped { url.stopAccessingSecurityScopedResource() }
+                    store.importFile(url, consume: false, securityScoped: true)
                 }
             }
             .alert("新建项目", isPresented: $newProject) {

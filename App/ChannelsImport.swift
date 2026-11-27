@@ -68,8 +68,8 @@ extension BeanStore {
                 problem = Problem(title: String(localized: "这条视频号链接没能导入"), detail: String(localized: "\(known)视频下下来了，但抽不出声音，可能是加密过的视频。"))
                 return
             }
-            finishLinkImport(id, audio: audio, title: title, author: author,
-                             page: "https://weixin.qq.com/sph/\(sph)", platform: platform, cues: [], video: media)
+            await finishLinkImport(id, audio: audio, title: title, author: author,
+                                   page: "https://weixin.qq.com/sph/\(sph)", platform: platform, cues: [], video: media)
         }
     }
 

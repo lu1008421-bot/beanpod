@@ -248,6 +248,9 @@ final class BeanStore {
     @ObservationIgnored var retranscribing: Set<UInt32> = []
     /// 这几条重新转写时走云端（录音页「交给云端重转」），不管平时用哪个引擎。
     @ObservationIgnored var viaCloud: Set<UInt32> = []
+    @ObservationIgnored var importingFiles: Set<String> = []
+    @ObservationIgnored var reservedImportIDs: Set<UInt32> = []
+    var importingCount = 0
     #if os(macOS)
     @ObservationIgnored var mcpServerProcess: Process?
     @ObservationIgnored var mcpTerminateObserver: NSObjectProtocol?
@@ -1049,8 +1052,18 @@ final class BeanStore {
         moveToTrash(id)
     }
 
+    func audioFileURL(for id: UInt32) -> URL? {
+        AudioStream.preferredAudioURL(ogg: oggURL(id), wav: wavURL(id))
+    }
+
     #if os(macOS)
-    func reveal(_ id: UInt32) { NSWorkspace.shared.activateFileViewerSelecting([oggURL(id)]) }
+    func reveal(_ id: UInt32) {
+        if let url = audioFileURL(for: id) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            toast("exclamationmark.triangle", String(localized: "找不到这条录音的音频文件"))
+        }
+    }
     #endif
 
     /// 连上录音豆时「叮」一声。手机上用一下轻震代替。

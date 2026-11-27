@@ -1547,7 +1547,7 @@ struct RecordingDetail: View {
                         Button("打开原链接") { NSWorkspace.shared.open(url) }
                         Button("拷贝原链接") { copy(source) }
                     }
-                    if recording.origin == nil { Button("在访达中显示音频") { store.reveal(recording.id) } }
+                    if !recording.textOnly && recording.downloaded { Button("在访达中显示音频") { store.reveal(recording.id) } }
                     if let url = FeishuSync.shared.link(for: recording.id) { Button("在飞书妙记里打开") { NSWorkspace.shared.open(url) } }
                 }
                 .disabled(store.stages[recording.id] != nil)
