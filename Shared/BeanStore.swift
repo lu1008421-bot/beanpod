@@ -326,6 +326,8 @@ final class BeanStore {
         loadTrash()
         loadProjects()
         loadPeople()
+        // 人物卡上次关闭前可能改过名/合并过：启动时把录音里的说话人标签和人物名单对齐一次
+        syncPeopleToLibrary()
         refreshASRAvailability()
         watchInbox()
         #if os(macOS)
