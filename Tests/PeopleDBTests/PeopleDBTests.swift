@@ -206,4 +206,53 @@ final class PeopleDBTests: XCTestCase {
         XCTAssertEqual(try db.listUtterancesForPerson(personID: b.id).count, 1)
         XCTAssertEqual(try db.listSamples(personID: a.id).count, 0)
     }
+
+    /// 重转写只替换自动归属，人工 `manual` 归属原样保留。
+    func testReplaceAutoUtterancesPreservesManual() throws {
+        let db = try openDB()
+        let p = try db.createPerson(displayName: "老王", status: .confirmed)
+        let manual = Utterance(id: UUID(), recordingID: 9, audioFingerprint: "f", startMs: 0, endMs: 2000, localSpeaker: 0, overlap: false, personID: p.id, source: "manual", score: 1, modelVersion: "")
+        try db.replaceUtterances(recordingID: 9, [manual])
+
+        let auto = Utterance(id: UUID(), recordingID: 9, audioFingerprint: "f", startMs: 2000, endMs: 4000, localSpeaker: 1, overlap: false, personID: nil, source: "auto", score: 0, modelVersion: "cam++")
+        try db.replaceAutoUtterances(recordingID: 9, [auto])
+
+        let utts = try db.listUtterances(recordingID: 9)
+        XCTAssertEqual(utts.filter { $0.source == "manual" }.count, 1, "manual 归属应保留")
+        XCTAssertEqual(utts.filter { $0.source == "auto" }.count, 1)
+        XCTAssertEqual(utts.first(where: { $0.source == "manual" })?.personID, p.id)
+    }
+
+    /// 批量把某本地说话人尚未归属的发言整批归属到某人，不影响已有人工归属。
+    func testAssignUtterancesByLocalSpeaker() throws {
+        let db = try openDB()
+        let p = try db.createPerson(displayName: "", status: .pending)
+        let u1 = Utterance(id: UUID(), recordingID: 10, audioFingerprint: "f", startMs: 0, endMs: 1000, localSpeaker: 0, overlap: false, personID: nil, source: "auto", score: 0.5, modelVersion: "cam++")
+        let u2 = Utterance(id: UUID(), recordingID: 10, audioFingerprint: "f", startMs: 1000, endMs: 2000, localSpeaker: 0, overlap: false, personID: nil, source: "auto", score: 0.5, modelVersion: "cam++")
+        try db.replaceUtterances(recordingID: 10, [u1, u2])
+        try db.assignUtterancesByLocalSpeaker(recordingID: 10, localSpeaker: 0, personID: p.id)
+        let utts = try db.listUtterances(recordingID: 10)
+        XCTAssertTrue(utts.allSatisfy { $0.personID == p.id })
+    }
+
+    /// 人物资料软删除后，重跑模型不会把它恢复；重跑只清自动条目、不动人工条目。
+    func testInsightsHideAndReplaceAuto() throws {
+        let db = try openDB()
+        let p = try db.createPerson(displayName: "李总", status: .confirmed)
+        let auto = PersonInsight(id: UUID(), personID: p.id, kind: .bio, text: "自动背景", recordingID: 11, startMs: 0, endMs: 1000, occurredAt: .now, editedByUser: false, modelVersion: "v1", stale: false)
+        let manual = PersonInsight(id: UUID(), personID: p.id, kind: .commitment, text: "人工改过的待办", recordingID: 11, startMs: 0, endMs: 1000, occurredAt: .now, editedByUser: true, modelVersion: "v1", stale: false)
+        try db.upsertInsight(auto)
+        try db.upsertInsight(manual)
+
+        try db.hideInsight(id: manual.id)
+        XCTAssertTrue(try db.listInsights(personID: p.id).first(where: { $0.id == manual.id })?.stale == true)
+
+        // 重跑：清自动、插新的自动条目，人工（已软删）不受影响
+        let fresh = PersonInsight(id: UUID(), personID: p.id, kind: .topic, text: "新的自动条目", recordingID: 11, startMs: 0, endMs: 1000, occurredAt: .now, editedByUser: false, modelVersion: "v1", stale: false)
+        try db.replaceAutoInsights(recordingID: 11, [fresh])
+        let after = try db.listInsights(personID: p.id)
+        XCTAssertFalse(after.contains { $0.id == auto.id }, "旧自动条目应被替换")
+        XCTAssertTrue(after.contains { $0.id == manual.id && $0.stale }, "软删的人工条目不得被恢复")
+        XCTAssertTrue(after.contains { $0.id == fresh.id })
+    }
 }

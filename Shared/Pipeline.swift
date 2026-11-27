@@ -248,6 +248,15 @@ extension BeanStore {
         recordings[j].analyzedBy = result.source
         saveLibrary()
 
+        #if os(macOS)
+        // 场景已定：把达标且场景允许的新声音升格为待认识卡，再触发有依据的人物摘要抽取
+        finalizeStrangerCards(id)
+        let hasAttributedSpeech = (try? peopleDB?.listUtterances(recordingID: id).contains { $0.personID != nil }) ?? false
+        if hasAttributedSpeech, localLLMReady, LocalLLM.modelURL != nil {
+            Task { await runPeopleInsights(id) }
+        }
+        #endif
+
         // 3. 润色：每句出一个去掉语气词、理顺了的版本，原文照旧留着
         let raw = recordings[j].segments
         guard !raw.isEmpty, raw.contains(where: { $0.clean == nil }) else { return }
@@ -1048,6 +1057,17 @@ extension BeanStore {
         job.start()
     }
 
+    #if os(macOS)
+    /// 下载（或接着下载）声纹模型：说话人分割 + 中英声纹向量（CAM++）。
+    func downloadSpeakerModels() {
+        if let job = speakerJob { job.start(); return }
+        let job = DownloadJob(files: SpeakerModels.defaults, folder: SpeakerEngine.modelFolder)
+        job.onFinish = { [weak self] ok in self?.speakerJob = nil; if ok { self?.addLog("声纹模型下载好了") } }
+        speakerJob = job
+        job.start()
+    }
+    #endif
+
     /// 上次没下完的（模型文件夹里有 .part），打开设置时显示成「已暂停」，点继续就接着下。
     func restorePausedDownloads() {
         func paused(_ files: [ModelFile], _ folder: URL) -> DownloadJob? {
@@ -1064,6 +1084,12 @@ extension BeanStore {
             j.onFinish = { [weak self] _ in self?.llmJob = nil; self?.refreshASRAvailability() }
             llmJob = j
         }
+        #if os(macOS)
+        if speakerJob == nil, let j = paused(SpeakerModels.defaults, SpeakerEngine.modelFolder) {
+            j.onFinish = { [weak self] _ in self?.speakerJob = nil }
+            speakerJob = j
+        }
+        #endif
     }
 
     #if os(macOS)

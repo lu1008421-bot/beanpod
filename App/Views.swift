@@ -2455,27 +2455,30 @@ struct TranscriptView: View {
                 Button(name) { store.setSpeaker(recording.id, start: seg.start, to: n) }
             }
             Button("新增说话人") { store.addSpeaker(recording.id, start: seg.start) }
-            // 改归人物库里已确认的联系人（含「我」）：人工指定优先于重跑模型
-            if !store.confirmedPeople.isEmpty || store.people.contains(where: \.isMe) {
-                Divider()
-                Text("改归人物").font(.caption).foregroundStyle(.secondary)
-                if let me = store.people.first(where: \.isMe) {
-                    Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: me.id) } label: {
-                        Label("我", systemImage: "person.fill")
-                    }
-                } else {
-                    Button {
-                        if let meID = store.createPerson(name: "我", status: .confirmed, isMe: true) {
-                            store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: meID)
-                        }
-                    } label: { Label("标为我", systemImage: "person.fill") }
+            // 改归人物库里的人物（含「我」）：人工指定优先于重跑模型；空人物库也能直接标我/升格路人
+            Divider()
+            Text("改归人物").font(.caption).foregroundStyle(.secondary)
+            if let me = store.people.first(where: \.isMe) {
+                Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: me.id) } label: {
+                    Label("我", systemImage: "person.fill")
                 }
-                ForEach(store.confirmedPeople) { p in
-                    Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: p.id) } label: {
-                        Label(p.displayName, systemImage: "person.crop.circle")
+            } else {
+                Button {
+                    if let meID = store.createPerson(name: "我", status: .confirmed, isMe: true) {
+                        store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: meID)
                     }
+                } label: { Label("标为我", systemImage: "person.fill") }
+            }
+            ForEach(store.confirmedPeople) { p in
+                Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: p.id) } label: {
+                    Label(p.displayName, systemImage: "person.crop.circle")
                 }
             }
+            Button {
+                if let pid = store.createPerson(name: "", status: .pending) {
+                    store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: pid)
+                }
+            } label: { Label("升格为待认识人物", systemImage: "person.crop.circle.badge.questionmark") }
             if let n = seg.speaker, recording.speakers.indices.contains(n) {
                 Divider()
                 Button("改名…") { newName = recording.speakers[n]; renaming = n }

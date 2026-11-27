@@ -17,6 +17,11 @@ struct PeopleView: View {
     @State private var importingFor: Person?
     // 合并
     @State private var mergingInto: Person?
+    // 新建联系人
+    @State private var addingPerson = false
+    @State private var addName = ""
+    // 样本管理抽屉
+    @State private var managingSamples: Person?
 
     private var confirmed: [Person] {
         let base = store.confirmedPeople
@@ -41,6 +46,9 @@ struct PeopleView: View {
         .sheet(item: $linking) { person in
             linkSheet(person)
         }
+        .sheet(isPresented: $addingPerson) { addPersonSheet }
+        .sheet(item: $managingSamples) { person in sampleSheet(person) }
+        .sheet(item: $mergingInto) { person in mergeSheet(person) }
         #if os(macOS)
         .fileImporter(isPresented: Binding(get: { importingFor != nil }, set: { if !$0 { importingFor = nil } }),
                       allowedContentTypes: [.audio, .movie], allowsMultipleSelection: true) { result in
@@ -161,14 +169,18 @@ struct PeopleView: View {
     }
 
     private func avatar(_ p: Person, size: CGFloat) -> some View {
-        let color = Theme.speakers[abs(p.colorIndex) % Theme.speakers.count]
+        let pending = p.status == .pending
+        let color = pending ? Theme.warm500 : Theme.speakers[abs(p.colorIndex) % Theme.speakers.count]
+        let fill = pending ? Theme.warm200.opacity(0.8) : color.opacity(0.14)
+        let stroke = pending ? Theme.warm400.opacity(0.6) : color.opacity(0.35)
+        let dash: [CGFloat] = pending ? [3, 2] : []
         let initial = p.isMe ? "我" : String((p.displayName.isEmpty ? "?" : p.displayName).prefix(1))
         return Text(initial)
             .font(.system(size: size * 0.42, weight: .semibold))
             .foregroundStyle(color.opacity(0.9))
             .frame(width: size, height: size)
-            .background(color.opacity(0.14), in: .circle)
-            .overlay(Circle().strokeBorder(color.opacity(0.35), lineWidth: 1))
+            .background(fill, in: .circle)
+            .overlay(Circle().strokeBorder(stroke, style: StrokeStyle(lineWidth: 1, dash: dash)))
     }
 
     // MARK: 右栏
@@ -208,10 +220,8 @@ struct PeopleView: View {
             avatar(p, size: 56)
             VStack(alignment: .leading, spacing: 4) {
                 if p.status == .confirmed, !p.isMe {
-                    TextField("姓名", text: Binding(
-                        get: { p.displayName },
-                        set: { store.renamePerson(id: p.id, to: $0) }))
-                        .textFieldStyle(.plain).font(.system(size: 22, weight: .bold, design: .rounded))
+                    RenameField(initial: p.displayName, id: p.id) { name in store.renamePerson(id: p.id, to: name) }
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
                 } else {
                     Text(p.isMe ? "我" : (p.displayName.isEmpty ? String(localized: "未记名 \(p.strangerLabel)") : p.displayName))
                         .font(.system(size: 22, weight: .bold, design: .rounded))
@@ -219,8 +229,11 @@ struct PeopleView: View {
                 HStack(spacing: 8) {
                     if p.status == .confirmed {
                         let n = store.samples(personID: p.id).count
-                        Text("\(n) 段声音样本").font(.caption.weight(.medium)).foregroundStyle(Theme.warm500)
-                            .padding(.horizontal, 8).padding(.vertical, 3).background(Theme.warm200.opacity(0.6), in: .capsule)
+                        Button { managingSamples = p } label: {
+                            Text("\(n) 段声音样本").font(.caption.weight(.medium)).foregroundStyle(Theme.warm500)
+                                .padding(.horizontal, 8).padding(.vertical, 3).background(Theme.warm200.opacity(0.6), in: .capsule)
+                        }
+                        .buttonStyle(.plain).help("管理声音样本")
                     }
                     if let last = p.lastMetAt { Text("最近 \(last.formatted(.dateTime.month().day()))").font(.caption).foregroundStyle(.tertiary) }
                 }
@@ -303,6 +316,12 @@ struct PeopleView: View {
                     Image(systemName: "quote.opening").font(.caption).foregroundStyle(Theme.warm400)
                     Text(it.text).font(.callout)
                     Spacer(minLength: 0)
+                    if let rid = it.recordingID, let s = it.startMs, let e = it.endMs {
+                        Button { store.playSpan(rid, Double(s) / 1000...Double(max(s, e)) / 1000, loop: false) } label: {
+                            Image(systemName: "play.circle.fill").font(.system(size: 15)).foregroundStyle(Theme.accent)
+                        }
+                        .buttonStyle(.plain).help("就地试听")
+                    }
                 }
             }
         }
@@ -310,7 +329,7 @@ struct PeopleView: View {
 
     private func timelineRow(_ row: PersonTimelineRow) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Button { store.play(row.recordingID, at: row.start) } label: {
+            Button { store.playSpan(row.recordingID, row.start...max(row.start, row.end), loop: false) } label: {
                 Image(systemName: "play.circle.fill").font(.system(size: 16)).foregroundStyle(Theme.accent)
             }
             .buttonStyle(.plain).help("从这里听")
@@ -352,7 +371,8 @@ struct PeopleView: View {
     // MARK: 弹层
 
     private func addPerson() {
-        store.createPerson(name: "", status: .confirmed)
+        addName = ""
+        addingPerson = true
     }
 
     private func nameSheet(_ p: Person) -> some View {
@@ -382,6 +402,112 @@ struct PeopleView: View {
             Button("取消") { linking = nil }.buttonStyle(.bordered)
         }
         .padding(20).frame(minWidth: 300)
+    }
+
+    private var addPersonSheet: some View {
+        VStack(spacing: 12) {
+            Text("添加联系人").font(.headline)
+            TextField("姓名", text: $addName).textFieldStyle(.roundedBorder).frame(maxWidth: 260)
+                .onSubmit(commitAdd)
+            HStack {
+                Button("取消") { addingPerson = false }.buttonStyle(.bordered)
+                Button("添加") { commitAdd() }
+                    .buttonStyle(.glassProminent).tint(Theme.accent)
+                    .disabled(addName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20).frame(minWidth: 300)
+    }
+
+    private func commitAdd() {
+        let name = addName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        if let id = store.createPerson(name: name, status: .confirmed) {
+            selected = id
+        }
+        addName = ""
+        addingPerson = false
+    }
+
+    private func sampleSheet(_ p: Person) -> some View {
+        let samples = store.samples(personID: p.id)
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("声音样本").font(.headline)
+            if samples.isEmpty {
+                Text("还没有样本。点右上角「⋯」→「导入声音样本」。").font(.callout).foregroundStyle(.secondary)
+            } else {
+                ForEach(samples) { s in
+                    HStack(spacing: 10) {
+                        if let name = s.managedFile {
+                            Button { store.playSampleFile(name) } label: {
+                                Image(systemName: store.isPlaying && store.playingID == nil ? "pause.circle.fill" : "play.circle.fill")
+                                    .font(.system(size: 16)).foregroundStyle(Theme.accent)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(s.channel == .speakerLoopback ? "外放" : "近场") · \(msLabel(s))").font(.callout)
+                            Text(s.sourceKind == .importedFile ? "导入" : "来自录音").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button(role: .destructive) { store.deleteSample(personID: p.id, sampleID: s.id) } label: {
+                            Image(systemName: "trash").font(.system(size: 13)).foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain).help("删除样本")
+                    }
+                }
+            }
+            HStack { Spacer(); Button("完成") { managingSamples = nil }.buttonStyle(.glassProminent).tint(Theme.accent) }
+        }
+        .padding(20).frame(minWidth: 360)
+    }
+
+    private func msLabel(_ s: VoiceSample) -> String {
+        String(format: "%.1f 秒", Double(max(0, s.endMs - s.startMs)) / 1000)
+    }
+
+    private func mergeSheet(_ p: Person) -> some View {
+        VStack(spacing: 12) {
+            Text("合并到「\(p.displayName)」").font(.headline)
+            Text("把另一张卡并进来：样本、发言与资料都归到这张卡，原卡删除，可撤销。").font(.callout).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(store.confirmedPeople.filter { $0.id != p.id }) { c in
+                        Button { store.mergePeople(primary: p.id, secondary: c.id); mergingInto = nil } label: {
+                            HStack { Text(c.displayName); Spacer() }
+                                .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if store.confirmedPeople.filter({ $0.id != p.id }).isEmpty {
+                        Text("没有其它可合并的联系人。").font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .frame(minHeight: 120)
+            HStack { Spacer(); Button("取消") { mergingInto = nil }.buttonStyle(.bordered) }
+        }
+        .padding(20).frame(minWidth: 320)
+    }
+}
+
+/// 只在回车或失焦时提交的姓名输入，避免每敲一个字就写一次库。
+private struct RenameField: View {
+    let initial: String
+    let id: UUID
+    let onCommit: (String) -> Void
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField("姓名", text: $text)
+            .textFieldStyle(.plain)
+            .focused($focused)
+            .onSubmit { onCommit(text) }
+            .onChange(of: focused) { _, f in if !f { onCommit(text) } }
+            .onChange(of: initial) { _, v in if !focused { text = v } }
+            .onAppear { text = initial }
     }
 }
 

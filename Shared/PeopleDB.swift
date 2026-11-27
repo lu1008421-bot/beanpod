@@ -27,6 +27,11 @@ nonisolated final class PeopleDB {
 
     static let schemaVersion = 1
 
+    /// 头像颜色按 UUID 稳定映射（跨天、改名、重启不变），不随机。
+    nonisolated static func colorIndex(for id: UUID) -> Int {
+        withUnsafeBytes(of: id.uuid) { bytes in bytes.reduce(0) { ($0 + Int($1)) % 6 } }
+    }
+
     let folder: URL
     let dbURL: URL
     private var db: OpaquePointer?
@@ -239,7 +244,7 @@ nonisolated final class PeopleDB {
     func createPerson(displayName: String, status: PersonStatus = .pending, isMe: Bool = false, note: String = "", colorIndex: Int? = nil, strangerIndex: Int? = nil) throws -> Person {
         let id = UUID()
         let idx = try strangerIndex ?? nextStrangerIndex()
-        let color = colorIndex ?? Int.random(in: 0..<6)
+        let color = colorIndex ?? Self.colorIndex(for: id)
         var stmt: OpaquePointer?
         guard let db, sqlite3_prepare_v2(db, "INSERT INTO persons(id,display_name,stranger_index,color_index,status,is_me,note,created_at) VALUES(?,?,?,?,?,?,?,?);", -1, &stmt, nil) == SQLITE_OK, let stmt else {
             throw Error.sql(String(cString: sqlite3_errmsg(db)))
@@ -462,6 +467,48 @@ nonisolated final class PeopleDB {
         }
     }
 
+    /// 只替换自动归属（`source != 'manual'`），保留人工指定的区间与人物归属（重转写不覆盖人工）。
+    func replaceAutoUtterances(recordingID: UInt32, _ utterances: [Utterance]) throws {
+        try transaction {
+            try update("DELETE FROM utterances WHERE recording_id=? AND source!='manual';", args: [String(recordingID)])
+            for u in utterances { try insertUtterance(u) }
+        }
+    }
+
+    /// 插入一条发言归属。
+    func insertUtterance(_ u: Utterance) throws {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        let sql = "INSERT INTO utterances(id,recording_id,audio_fingerprint,start_ms,end_ms,local_speaker,overlap,person_id,source,score,model_version) VALUES(?,?,?,?,?,?,?,?,?,?,?);"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, u.id.uuidString)
+        sqlite3_bind_int64(stmt, 2, Int64(u.recordingID))
+        bind(stmt, 3, u.audioFingerprint)
+        sqlite3_bind_int64(stmt, 4, Int64(u.startMs))
+        sqlite3_bind_int64(stmt, 5, Int64(u.endMs))
+        sqlite3_bind_int64(stmt, 6, Int64(u.localSpeaker))
+        sqlite3_bind_int(stmt, 7, u.overlap ? 1 : 0)
+        bind(stmt, 8, u.personID?.uuidString)
+        bind(stmt, 9, u.source)
+        sqlite3_bind_double(stmt, 10, u.score)
+        bind(stmt, 11, u.modelVersion)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    }
+
+    /// 把某条录音里某个本地说话人尚未归属（person_id 为空）的发言整批归属到某人物。
+    func assignUtterancesByLocalSpeaker(recordingID: UInt32, localSpeaker: Int, personID: UUID) throws {
+        guard let db else { throw Error.openFailed("not open") }
+        var stmt: OpaquePointer?
+        let sql = "UPDATE utterances SET person_id=?, source='auto' WHERE recording_id=? AND local_speaker=? AND person_id IS NULL;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, personID.uuidString)
+        sqlite3_bind_int64(stmt, 2, Int64(recordingID))
+        sqlite3_bind_int64(stmt, 3, Int64(localSpeaker))
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw Error.sql(String(cString: sqlite3_errmsg(db))) }
+    }
+
     func listUtterances(recordingID: UInt32) throws -> [Utterance] {
         guard let db else { throw Error.openFailed("not open") }
         var stmt: OpaquePointer?
@@ -556,6 +603,24 @@ nonisolated final class PeopleDB {
 
     func deleteInsight(id: UUID) throws {
         try update("DELETE FROM person_insights WHERE id=?;", args: [id.uuidString])
+    }
+
+    /// 软删除一条人物资料：标记 `stale=1` 且 `edited_by_user=1`，重跑模型不会恢复它。
+    func hideInsight(id: UUID) throws {
+        try update("UPDATE person_insights SET stale=1, edited_by_user=1 WHERE id=?;", args: [id.uuidString])
+    }
+
+    /// 人工编辑一条资料：写入新文本并标记人工，重跑不覆盖。
+    func editInsight(id: UUID, text: String) throws {
+        try update("UPDATE person_insights SET text=?, edited_by_user=1 WHERE id=?;", args: [text, id.uuidString])
+    }
+
+    /// 重跑一次录音的摘要：只清掉自动条目（`edited_by_user=0`）再插入新结果，人工编辑/删除的条目原样保留。
+    func replaceAutoInsights(recordingID: UInt32, _ insights: [PersonInsight]) throws {
+        try transaction {
+            try update("DELETE FROM person_insights WHERE recording_id=? AND edited_by_user=0;", args: [String(recordingID)])
+            for i in insights { try upsertInsight(i) }
+        }
     }
 
     // MARK: - 时间线、纠错与合并

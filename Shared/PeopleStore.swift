@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// 人物库与录音库的桥接：把跨录音的人物身份投影回 `Recording.people` / `Recording.speakers`，
@@ -158,19 +159,37 @@ extension BeanStore {
         } catch { peopleError = error.localizedDescription }
     }
 
-    /// 单句改归属：把某条录音某句发言（按说话人 + 时间定位）的归属改成指定人物。
-    /// 人工指定优先于重跑模型。找不到对应 utterance 时只改 Segment 的 speaker 显示。
+    /// 单句改归属：只改目标句对应区间，不串改同一 `localSpeaker` 的其它句子。
+    /// 实现：为该句单独开一个本地说话人槽位并落一条 manual 归属，人工优先级高于重跑模型。
     func reassignSegment(recordingID: UInt32, start: TimeInterval, localSpeaker: Int?, to personID: UUID?) {
-        guard let db = peopleDB else { return }
-        let ms = Int(start * 1000)
-        let utts = (try? db.listUtterances(recordingID: recordingID)) ?? []
-        if let hit = utts.first(where: { $0.localSpeaker == localSpeaker && ms >= $0.startMs && ms < $0.endMs }) {
-            do {
-                try db.assignUtterance(id: hit.id, personID: personID, source: "manual")
-                syncPeopleToLibrary([recordingID])
-                reloadPeople()
-            } catch { peopleError = error.localizedDescription }
-        }
+        guard let db = peopleDB,
+              let i = recordings.firstIndex(where: { $0.id == recordingID }),
+              let segIdx = recordings[i].segments.firstIndex(where: { abs($0.start - start) < 0.001 }) else { return }
+        var seg = recordings[i].segments[segIdx]
+        let startMs = Int(seg.start * 1000)
+        let endMs = max(startMs + 1, Int((seg.end ?? (seg.start + 1)) * 1000))
+        let newLocal = recordings[i].speakers.count
+        recordings[i].speakers.append("")
+        seg.speaker = newLocal
+        recordings[i].segments[segIdx] = seg
+        saveLibrary()
+
+        let u = Utterance(id: UUID(), recordingID: recordingID, audioFingerprint: "manual-\(recordingID)",
+                          startMs: startMs, endMs: endMs, localSpeaker: newLocal, overlap: false,
+                          personID: personID, source: "manual", score: 1, modelVersion: "")
+        do {
+            try db.insertUtterance(u)
+            // 记一条驳回对：原自动归属（如有）不再反复推荐
+            if let oldLocal = localSpeaker {
+                let old = (try? db.listUtterances(recordingID: recordingID)) ?? []
+                if let oldAuto = old.first(where: { $0.localSpeaker == oldLocal && $0.source != "manual" && $0.personID != nil && startMs >= $0.startMs && startMs < $0.endMs }),
+                   let oldPID = oldAuto.personID, oldPID != personID {
+                    try? db.addRejectedPair("\(oldPID.uuidString)|\(recordingID)-\(oldLocal)")
+                }
+            }
+            syncPeopleToLibrary([recordingID])
+            reloadPeople()
+        } catch { peopleError = error.localizedDescription }
     }
 
     /// 把两张卡合并成一张（次要并入主要），记录 merge_log 供撤销。
@@ -193,10 +212,12 @@ extension BeanStore {
         } catch { peopleError = error.localizedDescription }
     }
 
-    /// 某个人物的资料与往来事项。
+    /// 某个人物的资料与往来事项（排除已移入回收站/已删除录音派生出的条目）。
     func insights(personID: UUID) -> [PersonInsight] {
         guard let db = peopleDB else { return [] }
-        return (try? db.listInsights(personID: personID)) ?? []
+        let all = (try? db.listInsights(personID: personID)) ?? []
+        let live = Set(recordings.map(\.id))
+        return all.filter { $0.recordingID == nil || live.contains($0.recordingID!) }
     }
 
     /// 某个人物的声音样本。
@@ -218,7 +239,8 @@ extension BeanStore {
             }
             let snippet = segs.map { $0.clean ?? $0.text }.joined(separator: " ")
             return PersonTimelineRow(id: u.id, recordingID: u.recordingID, title: rec.displayTitle,
-                                     date: rec.date, snippet: snippet, start: Double(u.startMs) / 1000)
+                                     date: rec.date, snippet: snippet, start: Double(u.startMs) / 1000,
+                                     end: Double(u.endMs) / 1000)
         }
     }
 
@@ -232,12 +254,14 @@ extension BeanStore {
             let samplesDir = dataRoot.appendingPathComponent("People/Samples", isDirectory: true)
             try FileManager.default.createDirectory(at: samplesDir, withIntermediateDirectories: true)
             let managed = samplesDir.appendingPathComponent("\(UUID().uuidString).wav")
-            try QwenASR.wav(samples).write(to: managed, options: .atomic)
+            let wavData = QwenASR.wav(samples)
+            try wavData.write(to: managed, options: .atomic)
             let embedding = await SpeakerEngine.shared.embedWhole(samples)
+            let contentHash = SHA256.hash(data: wavData).map { String(format: "%02x", $0) }.joined()
             let sample = VoiceSample(id: UUID(), personID: personID, sourceKind: .importedFile, recordingID: nil,
                                      startMs: 0, endMs: samples.count * 1000 / 16000, managedFile: managed.lastPathComponent,
                                      channel: .nearField, confirmed: true, modelVersion: SpeakerEngine.embeddingCAMPPName,
-                                     contentHash: "")
+                                     contentHash: contentHash)
             try db.addSample(sample, embedding: embedding)
             return true
         } catch {
@@ -246,6 +270,13 @@ extension BeanStore {
         }
     }
     #endif
+
+    /// 删除某人的一段声音样本（被删样本不再参与匹配）。
+    func deleteSample(personID: UUID, sampleID: UUID) {
+        guard let db = peopleDB else { return }
+        do { try db.deleteSample(id: sampleID) }
+        catch { peopleError = error.localizedDescription }
+    }
 }
 
 /// 人物时间线的一行：一次发言 + 所在录音 + 原句。
@@ -256,4 +287,5 @@ nonisolated struct PersonTimelineRow: Identifiable, Equatable {
     let date: Date?
     let snippet: String
     let start: TimeInterval
+    let end: TimeInterval
 }

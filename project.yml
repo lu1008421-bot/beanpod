@@ -102,6 +102,7 @@ targets:
     sources:
       - Shared/People.swift
       - Shared/PeopleDB.swift
+      - Shared/SpeakerMatching.swift
       - Tests/PeopleDBTests
     settings:
       base:

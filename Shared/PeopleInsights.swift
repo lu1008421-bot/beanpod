@@ -14,21 +14,22 @@ nonisolated struct ExtractedPersonInsight: Sendable, Equatable {
 nonisolated enum PersonInsightExtractor {
     struct IndexedLine: Sendable, Equatable {
         var index: Int            // 1 起
-        var person: String
+        var person: String        // 显示名（喂给模型）
+        var personID: UUID?       // 权威身份（由 utterances 解析，防同名串人）
         var text: String
         var start: TimeInterval
         var end: TimeInterval
     }
 
     /// 把逐句文字稿编成 `[#N] 人：原文`，供模型引用句号。
-    static func indexedTranscript(segments: [Segment], speakerNames: [String]) -> [IndexedLine] {
+    static func indexedTranscript(segments: [Segment], labels: [String], personIDs: [UUID?]) -> [IndexedLine] {
         segments.enumerated().map { n, seg in
-            let name = seg.speaker.flatMap { $0 < speakerNames.count ? speakerNames[$0] : nil } ?? ""
-            return IndexedLine(index: n + 1,
-                               person: name.isEmpty ? String(localized: "说话人") : name,
-                               text: seg.clean ?? seg.text,
-                               start: seg.start,
-                               end: seg.end ?? seg.start)
+            IndexedLine(index: n + 1,
+                        person: n < labels.count ? labels[n] : String(localized: "说话人"),
+                        personID: n < personIDs.count ? personIDs[n] : nil,
+                        text: seg.clean ?? seg.text,
+                        start: seg.start,
+                        end: seg.end ?? seg.start)
         }
     }
 
@@ -74,17 +75,35 @@ nonisolated enum PersonInsightExtractor {
 
 extension BeanStore {
     /// 对一条已归人的录音抽人物背景与往来事项，反查句号区间后写入人物库。
-    /// 人工 `edited_by_user` 的条目不会被覆盖（`upsertInsight` 只按 id 更新）。
+    /// 默认只用本机 `LocalLLM`，不因人物模块把带真实姓名的档案静默发往云端；无本机模型时直接跳过。
     func runPeopleInsights(_ id: UInt32) async {
         guard let rec = recordings.first(where: { $0.id == id }),
-              rec.segments.contains(where: { $0.speaker != nil }),
-              peopleDB != nil, !asking else { return }
-        let lines = PersonInsightExtractor.indexedTranscript(segments: rec.segments, speakerNames: rec.speakers)
-        guard !lines.isEmpty, analysisAvailable else { return }
-        do {
-            let extracted = try await withLLM { config in
-                try await PersonInsightExtractor.extract(lines: lines, config: config)
+              let db = peopleDB, !asking else { return }
+
+        // 逐句按时间落在归属区间内解析 personID（权威来源），显示名只做喂模型的标签
+        let utterances = (try? db.listUtterances(recordingID: id)) ?? []
+        var labels: [String] = []
+        var personIDs: [UUID?] = []
+        for seg in rec.segments {
+            let t = Int(seg.start * 1000)
+            let pid = utterances.first { $0.personID != nil && t >= $0.startMs && t < $0.endMs }?.personID
+            personIDs.append(pid)
+            if let pid, let p = people.first(where: { $0.id == pid }) {
+                labels.append(p.isMe ? String(localized: "我") : (p.displayName.isEmpty ? String(localized: "未记名 \(p.strangerLabel)") : p.displayName))
+            } else if let s = seg.speaker, rec.speakers.indices.contains(s) {
+                labels.append(rec.speakers[s])
+            } else {
+                labels.append(String(localized: "说话人"))
             }
+        }
+
+        let lines = PersonInsightExtractor.indexedTranscript(segments: rec.segments, labels: labels, personIDs: personIDs)
+        guard lines.contains(where: { $0.personID != nil }) else { return }
+        guard localLLMReady, LocalLLM.modelURL != nil else { return }
+
+        do {
+            let local = try await LocalLLM.shared.ensureRunning(serverPath: settings.llamaServerPath)
+            let extracted = try await PersonInsightExtractor.extract(lines: lines, config: local)
             applyPeopleInsights(extracted, lines: lines, recordingID: id)
         } catch {
             addLog("人物信息抽取失败：\(error.localizedDescription)")
@@ -94,16 +113,24 @@ extension BeanStore {
     private func applyPeopleInsights(_ extracted: [ExtractedPersonInsight], lines: [PersonInsightExtractor.IndexedLine], recordingID: UInt32) {
         guard let db = peopleDB else { return }
         let recDate = recordings.first(where: { $0.id == recordingID })?.date
+        var insights: [PersonInsight] = []
         for e in extracted {
-            guard let person = people.first(where: { $0.displayName == e.personName }) else { continue }
+            // 只通过带权威 personID 的句子反查身份：同名多人时拒绝归属（防串人）
+            guard let personID = resolvePersonID(name: e.personName, lines: lines) else { continue }
             let picked = lines.filter { e.segmentIndices.contains($0.index) }
             let startMs = picked.map { Int($0.start * 1000) }.min()
             let endMs = picked.map { Int($0.end * 1000) }.max()
-            let insight = PersonInsight(id: UUID(), personID: person.id, kind: e.kind, text: e.text,
-                                        recordingID: recordingID, startMs: startMs, endMs: endMs,
-                                        occurredAt: recDate, editedByUser: false, modelVersion: "people-v1", stale: false)
-            do { try db.upsertInsight(insight) }
-            catch { peopleError = error.localizedDescription }
+            insights.append(PersonInsight(id: UUID(), personID: personID, kind: e.kind, text: e.text,
+                                          recordingID: recordingID, startMs: startMs, endMs: endMs,
+                                          occurredAt: recDate, editedByUser: false, modelVersion: "people-v1", stale: false))
         }
+        do { try db.replaceAutoInsights(recordingID: recordingID, insights) }
+        catch { peopleError = error.localizedDescription }
+    }
+
+    /// 把模型回的人名映射到权威 personID：只在句子中恰好对应一个人时成立，同名多人则放弃。
+    private func resolvePersonID(name: String, lines: [PersonInsightExtractor.IndexedLine]) -> UUID? {
+        let ids = Set(lines.filter { $0.person == name }.compactMap(\.personID))
+        return ids.count == 1 ? ids.first : nil
     }
 }
