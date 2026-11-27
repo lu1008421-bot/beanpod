@@ -9,6 +9,9 @@ options:
 packages:
   BeanKit:
     path: .
+  sherpa-onnx:
+    url: https://github.com/k2-fsa/sherpa-onnx
+    exactVersion: 2.0.3
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -25,6 +28,8 @@ targets:
     sources: [App, Shared]
     dependencies:
       - package: BeanKit
+      - package: sherpa-onnx
+        product: sherpa-onnx
       - target: beanpod-cli
         link: false
         embed: false
@@ -68,6 +73,24 @@ targets:
         PRODUCT_NAME: beanpod
         PRODUCT_BUNDLE_IDENTIFIER: com.andyhu.beanpod.cli
         SWIFT_VERSION: "5.0"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: NO
+        SKIP_INSTALL: YES
+  speaker-lab:
+    type: tool
+    platform: macOS
+    sources:
+      - App/SpeakerEngine.swift
+      - tools/speaker-lab
+    dependencies:
+      - package: sherpa-onnx
+        product: sherpa-onnx
+    settings:
+      base:
+        PRODUCT_NAME: speaker-lab
+        SWIFT_VERSION: "6.0"
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: "-"
