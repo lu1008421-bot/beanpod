@@ -1,3 +1,4 @@
+import BeanKit
 import Foundation
 import Observation
 
@@ -97,6 +98,16 @@ final class AppSettings {
     /// 密钥存在钥匙串里（Keychain.swift），不进 UserDefaults。
     var llmKey: String { didSet { Keychain.set(llmKey, for: "llmKey") } }
 
+    /// 逐句润色策略：默认用零成本本地规则去语气词；按需可改回 AI 逐句润色或关闭。
+    var polishMode: LLMPolishMode { didSet { save("polishMode", polishMode.rawValue) } }
+
+    /// 轻量分析模型（可选）：分块摘要、逐句润色、重起标题、语音输入润色优先走这里；接口或密钥留空时继承主服务。
+    var lightLLMBaseURL: String { didSet { save("lightLLMBaseURL", lightLLMBaseURL) } }
+    var lightLLMModel: String { didSet { save("lightLLMModel", lightLLMModel) } }
+    var lightLLMKey: String { didSet { Keychain.set(lightLLMKey, for: "lightLLMKey") } }
+    /// 自动模式下，轻量任务是否优先走本机内置 Qwen3-4B（免费且不外发）。
+    var lightUseLocalFirst: Bool { didSet { save("lightUseLocalFirst", lightUseLocalFirst) } }
+
     /// 翻译：译成什么语言、默认用哪种风格、自定义风格的提示词、外语素材导入后要不要自动翻译。
     var translateTo: String { didSet { save("translateTo", translateTo) } }
     var translateStyle: TranslateStyle { didSet { save("translateStyle", translateStyle.rawValue) } }
@@ -117,9 +128,26 @@ final class AppSettings {
 
     var llamaServerPath: String { didSet { save("llamaServerPath", llamaServerPath) } }
     var exportFolder: String { didSet { save("exportFolder", exportFolder) } }
+    /// 本机 HTTP MCP 网址入口默认关闭，仅给只认网址的工具按需开启。
+    var httpMCPEnabled: Bool { didSet { save("httpMCPEnabled", httpMCPEnabled) } }
 
     var llmConfigured: Bool { !llmBaseURL.isEmpty && !llmModel.isEmpty }
     var llmIsLocal: Bool { llmBaseURL.contains("127.0.0.1") || llmBaseURL.contains("localhost") }
+    var lightLLMConfigured: Bool { !lightLLMModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    var primaryCloudEndpoint: LLMRouteEndpoint? {
+        let endpoint = LLMRouteEndpoint(baseURL: llmBaseURL, model: llmModel, key: llmKey)
+        return endpoint.isConfigured ? endpoint : nil
+    }
+
+    var lightCloudEndpoint: LLMRouteEndpoint? {
+        LLMRouter.effectiveLightEndpoint(
+            primary: primaryCloudEndpoint,
+            lightBaseURL: lightLLMBaseURL,
+            lightModel: lightLLMModel,
+            lightKey: lightLLMKey
+        )
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -156,6 +184,11 @@ final class AppSettings {
         llmBaseURL = d.string(forKey: "llmBaseURL") ?? ""
         llmModel = d.string(forKey: "llmModel") ?? ""
         llmKey = Keychain.migrate("llmKey")
+        polishMode = LLMPolishMode(rawValue: d.string(forKey: "polishMode") ?? "") ?? .rules
+        lightLLMBaseURL = d.string(forKey: "lightLLMBaseURL") ?? ""
+        lightLLMModel = d.string(forKey: "lightLLMModel") ?? ""
+        lightLLMKey = Keychain.migrate("lightLLMKey")
+        lightUseLocalFirst = d.object(forKey: "lightUseLocalFirst") as? Bool ?? true
         translateTo = d.string(forKey: "translateTo") ?? "简体中文"
         translateStyle = TranslateStyle(rawValue: d.string(forKey: "translateStyle") ?? "") ?? .general
         translatePrompt = d.string(forKey: "translatePrompt") ?? ""
@@ -167,6 +200,7 @@ final class AppSettings {
         asrKey = Keychain.migrate("asrKey")
         llamaServerPath = d.string(forKey: "llamaServerPath") ?? ""
         exportFolder = d.string(forKey: "exportFolder") ?? ""
+        httpMCPEnabled = d.object(forKey: "httpMCPEnabled") as? Bool ?? false
     }
 
     private func save(_ key: String, _ value: Any) { UserDefaults.standard.set(value, forKey: key) }

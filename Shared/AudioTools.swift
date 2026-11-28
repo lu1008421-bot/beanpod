@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import BeanKit
 import Foundation
 
 nonisolated enum ASRError: LocalizedError {
@@ -20,27 +21,8 @@ extension QwenASR {
     // MARK: 音频处理
 
     nonisolated static func loadMono16k(_ url: URL) throws -> [Float] {
-        guard let file = try? AVAudioFile(forReading: url),
-              let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-              let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
-            throw ASRError.badAudio
-        }
-        try file.read(into: input)
-        if file.processingFormat.sampleRate == 16000, file.processingFormat.channelCount == 1, let d = input.floatChannelData {
-            return Array(UnsafeBufferPointer(start: d[0], count: Int(input.frameLength)))
-        }
-        guard let converter = AVAudioConverter(from: file.processingFormat, to: target),
-              let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: AVAudioFrameCount(Double(input.frameLength) * 16000 / file.processingFormat.sampleRate) + 1024) else {
-            throw ASRError.badAudio
-        }
-        nonisolated(unsafe) var pending: AVAudioPCMBuffer? = input
-        var error: NSError?
-        converter.convert(to: output, error: &error) { _, status in
-            if let b = pending { pending = nil; status.pointee = .haveData; return b }
-            status.pointee = .endOfStream; return nil
-        }
-        guard error == nil, let d = output.floatChannelData else { throw ASRError.badAudio }
-        return Array(UnsafeBufferPointer(start: d[0], count: Int(output.frameLength)))
+        do { return try AudioStream.loadMono16k(url) }
+        catch { throw ASRError.badAudio }
     }
 
     /// 切成不超过 28 秒的段，切点选在 20–28 秒之间最安静的地方，尽量不把一句话拦腰切断。
@@ -105,15 +87,6 @@ extension QwenASR {
     }
 
     nonisolated static func wav(_ samples: [Float], rate: Int = 16000) -> Data {
-        var d = Data(capacity: 44 + samples.count * 2)
-        func u32(_ v: Int) { withUnsafeBytes(of: UInt32(v).littleEndian) { d.append(contentsOf: $0) } }
-        func u16(_ v: Int) { withUnsafeBytes(of: UInt16(v).littleEndian) { d.append(contentsOf: $0) } }
-        d.append(contentsOf: Array("RIFF".utf8)); u32(36 + samples.count * 2)
-        d.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16)
-        d.append(contentsOf: Array("data".utf8)); u32(samples.count * 2)
-        for s in samples {
-            withUnsafeBytes(of: Int16(max(-1, min(1, s)) * 32767).littleEndian) { d.append(contentsOf: $0) }
-        }
-        return d
+        AudioStream.encodeWAV(samples, rate: rate)
     }
 }

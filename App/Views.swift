@@ -1591,6 +1591,10 @@ struct RecordingDetail: View {
                     Menu("移到项目") { ProjectMenuItems(ids: [recording.id]) }
                     Divider()
                     Button("重新整理纪要") { store.process(recording.id) }.disabled(recording.transcript == nil)
+                    Button(store.polishing.contains(recording.id) ? "正在用 AI 润色文字稿…" : "用 AI 润色文字稿") {
+                        store.polishRecording(recording.id)
+                    }
+                    .disabled(recording.segments.isEmpty || !store.lightAnalysisAvailable || store.polishing.contains(recording.id) || store.stages[recording.id] != nil)
                     Button("重新转写") { store.process(recording.id, retranscribe: true) }.disabled(recording.textOnly)
                     if store.peopleDB != nil, !recording.textOnly {
                     Divider()
@@ -1618,7 +1622,7 @@ struct RecordingDetail: View {
                         Button("打开原链接") { NSWorkspace.shared.open(url) }
                         Button("拷贝原链接") { copy(source) }
                     }
-                    if recording.origin == nil { Button("在访达中显示音频") { store.reveal(recording.id) } }
+                    if !recording.textOnly && recording.downloaded { Button("在访达中显示音频") { store.reveal(recording.id) } }
                     if let url = FeishuSync.shared.link(for: recording.id) { Button("在飞书妙记里打开") { NSWorkspace.shared.open(url) } }
                 }
                 .disabled(store.stages[recording.id] != nil)
@@ -1641,6 +1645,9 @@ struct RecordingDetail: View {
             parts.append(thisYear ? d.formatted(.dateTime.month().day().hour().minute()) : d.formatted(.dateTime.year().month().day().hour().minute()))
         }
         if !recording.textOnly { parts.append(spokenDuration(recording.duration)) }
+        if recording.llmTokens > 0 {
+            parts.append(String(localized: "AI \(LLMUsageLedger.formatTokens(recording.llmTokens)) tokens"))
+        }
         return "•  " + parts.joined(separator: "  •  ")
     }
 

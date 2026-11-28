@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import BeanKit
 import Foundation
 
 /// 用 llama.cpp 在本机跑 Qwen3‑ASR。录音不出这台电脑。
@@ -90,18 +91,49 @@ actor QwenASR {
 
     func transcribe(_ url: URL, serverPath: String, progress: @Sendable @escaping (Double) -> Void) async throws -> [Segment] {
         let port = try await ensureRunning(serverPath: serverPath)
-        let samples = try Self.loadMono16k(url)
-        // 按停顿切成一句一句的，每句都有自己的时间，方便点着听、标说话人
-        let chunks = Self.sentenceChunks(samples)
+        let reader: Mono16kStreamReader
+        do { reader = try Mono16kStreamReader(url: url) } catch { throw ASRError.badAudio }
+        let rate = AudioStream.sampleRate
+        let longest = 15 * rate
+        let totalEstimated = max(1, reader.estimatedTotalFrames)
+        var buffer: [Float] = []
+        var processedFrames = 0
         var out: [Segment] = []
-        for (i, c) in chunks.enumerated() {
+
+        while true {
             try Task.checkCancellation()
-            progress(Double(i) / Double(chunks.count))
-            let piece = Array(samples[c])
-            // 几乎没有声音的片段直接跳过，模型在静音上容易凭空编字
-            guard BeanStore.hasSpeech(piece) else { continue }
-            let text = try await recognize(Self.wav(piece), port: port)
-            if !text.isEmpty, !BeanStore.isFiller(text) { out.append(Segment(start: Double(c.lowerBound) / 16000, text: text)) }
+            while buffer.count <= longest && !reader.isAtEnd {
+                let next: [Float]
+                do { next = try reader.readNext() } catch { throw ASRError.badAudio }
+                if next.isEmpty { break }
+                buffer.append(contentsOf: next)
+            }
+            if buffer.count > longest {
+                let window = Array(buffer[..<longest])
+                let frames = BeanStore.lastPause(in: window, forced: true) ?? (longest / 320)
+                let cut = max(rate * 3 / 2, min(frames * 320, longest))
+                let piece = Array(buffer[..<cut])
+                buffer.removeFirst(cut)
+                progress(min(0.99, Double(processedFrames) / Double(totalEstimated)))
+                if BeanStore.hasSpeech(piece) {
+                    let text = try await recognize(Self.wav(piece), port: port)
+                    if !text.isEmpty, !BeanStore.isFiller(text) {
+                        out.append(Segment(start: Double(processedFrames) / Double(rate), text: text))
+                    }
+                }
+                processedFrames += cut
+            } else if reader.isAtEnd {
+                if buffer.count > rate / 4 {
+                    progress(min(0.99, Double(processedFrames) / Double(totalEstimated)))
+                    if BeanStore.hasSpeech(buffer) {
+                        let text = try await recognize(Self.wav(buffer), port: port)
+                        if !text.isEmpty, !BeanStore.isFiller(text) {
+                            out.append(Segment(start: Double(processedFrames) / Double(rate), text: text))
+                        }
+                    }
+                }
+                break
+            }
         }
         progress(1)
         return out

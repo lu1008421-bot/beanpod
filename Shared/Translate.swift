@@ -1,3 +1,4 @@
+import BeanKit
 import Foundation
 
 /// 一份译文：一句对一句，和文字稿的分句一一对应。
@@ -112,15 +113,16 @@ extension BeanStore {
                 // 一批四十句左右、两千五百字以内，分批送：一次塞太多，模型容易漏行或串行
                 for batch in Self.batches(lines) {
                     let numbered = batch.enumerated().map { "\($0.offset + 1). \($0.element.replacingOccurrences(of: "\n", with: " "))" }.joined(separator: "\n")
-                    let (reply, used) = try await withLLM { config in
-                        (try await Analyzer.chat(config,
+                    let (reply, used) = try await withLLM(task: .translate, tier: .primary, recordingID: rid) { config in
+                        let res = try await Analyzer.chatDetailed(config,
                             system: """
                             你是专业译者。把用户给的每一行译成\(language)。\(requirement)
                             这些句子来自同一段音视频的文字稿（\(context)），前后连贯，按上下文理解指代和省略。
                             输出格式必须严格是：和输入同样多的行，每行以「序号. 」开头，后面只写这一行的译文。不要合并、拆分或跳过任何一行，不要加解释。
                             原文已经是\(language)的行，照抄原文。
                             """,
-                            user: numbered, json: false), config.model)
+                            user: numbered, json: false)
+                        return ((res.content, config.model), res.usage)
                     }
                     model = used
                     let parsed = Self.parseNumbered(Analyzer.stripThinking(reply), count: batch.count)

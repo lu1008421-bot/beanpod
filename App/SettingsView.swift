@@ -1,3 +1,4 @@
+import BeanKit
 import SwiftUI
 
 /// 设置窗口。分成五个页签，每页一屏放完：以前是一条很长的表单，找一个选项要滚半天，
@@ -382,6 +383,7 @@ private struct ModelsPane: View {
     @State private var asrSheet = false
     @State private var testNote: String?
     @State private var testing = false
+    @State private var lightExpanded = false
 
     var body: some View {
         @Bindable var settings = store.settings
@@ -499,6 +501,9 @@ private struct ModelsPane: View {
                     Divider()
                     half(String(localized: "云端服务"), dim: settings.analysisMode == .local) {
                         Text(cloudSummary).font(.body.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                        if let light = settings.lightCloudEndpoint {
+                            Text("轻量：\(light.model)").font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        }
                         HStack {
                             Button(settings.llmConfigured ? "更改…" : "设置…") { cloudSheet = true }
                             if settings.llmConfigured {
@@ -510,6 +515,67 @@ private struct ModelsPane: View {
                     }
                 }
                 .fixedSize(horizontal: false, vertical: true)
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("逐句润色").font(.body.weight(.medium))
+                    Picker("逐句润色", selection: $settings.polishMode) {
+                        Text("规则去语气词（免费）").tag(LLMPolishMode.rules)
+                        Text("AI 逐句润色").tag(LLMPolishMode.llm)
+                        Text("关闭").tag(LLMPolishMode.off)
+                    }
+                    .pickerStyle(.segmented).labelsHidden().controlSize(.large)
+                    Text(polishHint(settings.polishMode))
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("自动模式下优先用本机 Qwen3‑4B 处理轻量任务", isOn: $settings.lightUseLocalFirst)
+                        .disabled(settings.analysisMode != .auto)
+                    Text("分块摘要（长录音）、逐句润色、重起标题、语音输入润色默认先走本机或下方轻量模型，不直接烧主模型。")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    DisclosureGroup(isExpanded: $lightExpanded) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 10) {
+                                GridRow {
+                                    Text("模型名")
+                                    TextField("模型名", text: $settings.lightLLMModel, prompt: Text("如 gpt-4o-mini / qwen-turbo / deepseek-chat"))
+                                        .textFieldStyle(.roundedBorder)
+                                }
+                                GridRow {
+                                    Text("接口地址")
+                                    TextField("接口地址", text: $settings.lightLLMBaseURL, prompt: Text("留空则继承主云端服务"))
+                                        .textFieldStyle(.roundedBorder)
+                                }
+                                GridRow {
+                                    Text("密钥")
+                                    SecureField("API Key（留空则继承同域主密钥）", text: $settings.lightLLMKey)
+                                        .textFieldStyle(.roundedBorder)
+                                }
+                            }
+                            HStack {
+                                Text(lightSummary)
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                if settings.lightLLMConfigured || !settings.lightLLMBaseURL.isEmpty || !settings.lightLLMKey.isEmpty {
+                                    Button("清空轻量配置") {
+                                        settings.lightLLMModel = ""
+                                        settings.lightLLMBaseURL = ""
+                                        settings.lightLLMKey = ""
+                                    }
+                                }
+                            }
+                        }
+                        .padding(12)
+                        .panel(radius: Theme.Radius.card)
+                    } label: {
+                        HStack {
+                            Text("轻量模型（可选）").font(.body.weight(.medium))
+                            Spacer()
+                            Text(settings.lightCloudEndpoint?.model ?? String(localized: "未单独设置"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
                 Text("下载断了会从断点接着下；HuggingFace 太慢时自动换国内镜像，下完按 SHA‑256 校验。本机模型不联网；云端纪要质量更高，但文字稿会发给服务商，录音本身不会。")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
@@ -537,10 +603,123 @@ private struct ModelsPane: View {
                 Toggle("外语素材整理完自动翻译", isOn: $settings.autoTranslate).toggleStyle(.switch)
                 Text("用的是上面整理纪要的那个模型（云端优先），按句翻译，原文和译文一句对一句。").font(.callout).foregroundStyle(.secondary)
             }
+            let usage = store.usageSummary
+            ModelCard(
+                icon: "chart.bar",
+                title: String(localized: "AI 用量统计"),
+                ok: true,
+                status: usage.totalCalls > 0 ? String(localized: "已记录 \(usage.totalCalls) 次") : String(localized: "暂无调用")
+            ) {
+                HStack(spacing: 12) {
+                    usageMetricBox(
+                        title: String(localized: "今日"),
+                        value: LLMUsageLedger.formatTokens(usage.todayTokens),
+                        detail: String(localized: "云端 \(LLMUsageLedger.formatTokens(usage.todayCloudTokens))")
+                    )
+                    usageMetricBox(
+                        title: String(localized: "近 30 天"),
+                        value: LLMUsageLedger.formatTokens(usage.last30DaysTokens),
+                        detail: String(localized: "云端 \(LLMUsageLedger.formatTokens(usage.last30DaysCloudTokens))")
+                    )
+                    usageMetricBox(
+                        title: String(localized: "累计"),
+                        value: LLMUsageLedger.formatTokens(usage.totalTokens),
+                        detail: String(localized: "云端 \(LLMUsageLedger.formatTokens(usage.cloudTokens)) · 本机 \(LLMUsageLedger.formatTokens(usage.localTokens))")
+                    )
+                }
+                if !usage.byTask.isEmpty {
+                    let taskItems = usage.byTask
+                        .sorted { $0.value == $1.value ? $0.key.rawValue < $1.key.rawValue : $0.value > $1.value }
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("按环节分布").font(.callout.weight(.medium))
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], alignment: .leading, spacing: 6) {
+                            ForEach(taskItems, id: \.key) { item in
+                                HStack {
+                                    Text(taskLabel(item.key)).foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text(LLMUsageLedger.formatTokens(item.value)).monospacedDigit()
+                                }
+                                .font(.caption)
+                            }
+                        }
+                    }
+                }
+                if !usage.byModel.isEmpty {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("按模型明细").font(.callout.weight(.medium))
+                        ForEach(usage.byModel) { row in
+                            HStack(spacing: 8) {
+                                Text(row.model).lineLimit(1).truncationMode(.middle)
+                                Text(row.builtInLocal ? "本机" : row.providerHost)
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(.quaternary.opacity(0.4), in: .capsule)
+                                Spacer()
+                                Text("\(row.calls) 次").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                                Text("\(LLMUsageLedger.formatTokens(row.totalTokens)) tokens")
+                                    .font(.caption.weight(.medium)).monospacedDigit()
+                            }
+                            .font(.callout)
+                        }
+                    }
+                }
+                HStack {
+                    Text("仅在本机记录 token 统计与接口域名，不保存接口密钥或文本内容（最多保留 5,000 条）。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("清空统计") { store.clearUsageLedger() }
+                        .disabled(store.usageEntries.isEmpty)
+                }
+            }
         }
         .sheet(isPresented: $cloudSheet) { CloudServiceSheet() }
         .sheet(isPresented: $asrSheet) { CloudASRSheet() }
         .onAppear { store.restorePausedDownloads(); store.refreshASRAvailability() }
+    }
+
+    private var lightSummary: String {
+        if let endpoint = store.settings.lightCloudEndpoint {
+            return String(localized: "当前将走 \(endpoint.providerHost) · \(endpoint.model)")
+        }
+        if store.settings.lightLLMConfigured {
+            return String(localized: "请先设置主云端接口地址，或在这里填写轻量接口地址")
+        }
+        return String(localized: "未单独设置时，需要云端调用的轻量任务将回落到主云端模型")
+    }
+
+    private func polishHint(_ mode: LLMPolishMode) -> String {
+        switch mode {
+        case .rules: String(localized: "默认用本地规则去掉「呃、嗯、就是」等口头禅，零 token 开销；需要时可在单条录音「更多」里点「用 AI 润色文字稿」。")
+        case .llm: String(localized: "每次整理纪要后自动调用轻量模型逐句润色文字稿，保留原句并替换口头禅。")
+        case .off: String(localized: "不做自动润色，保留原始转写分句。")
+        }
+    }
+
+    private func taskLabel(_ task: LLMTaskKind) -> String {
+        switch task {
+        case .analyzeChunk: String(localized: "长文分块")
+        case .analyzeFinal: String(localized: "纪要整理")
+        case .polish: String(localized: "逐句润色")
+        case .retitle: String(localized: "重起标题")
+        case .dictation: String(localized: "语音输入")
+        case .rewrite: String(localized: "改写")
+        case .ask: String(localized: "知识库提问")
+        case .translate: String(localized: "翻译")
+        case .study: String(localized: "英语学习")
+        }
+    }
+
+    private func usageMetricBox(title: String, value: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.title3.weight(.semibold)).monospacedDigit()
+            Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .panel(radius: Theme.Radius.card)
     }
 
     private func serverHint(_ server: URL?) -> String {
@@ -939,9 +1118,11 @@ private struct VocabularyPane: View {
 // MARK: 连接
 
 private struct ConnectPane: View {
+    @Environment(BeanStore.self) private var store
     @Environment(\.openWindow) private var openWindow
     @Environment(Connector.self) private var connector
     @State private var copied = false
+    @State private var rotated = false
 
     var body: some View {
         PaneFrame {
@@ -957,13 +1138,31 @@ private struct ConnectPane: View {
 
             LoginsGroup()
 
-            SettingsGroup(String(localized: "给其他工具用"), footer: String(localized: "这个地址只在这台电脑上能访问，而且只有豆仓开着的时候才通。")) {
-                SettingRow(icon: "network", title: String(localized: "接入地址")) {
-                    Text(BeanStore.mcpAddress).font(.callout.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                    Button(copied ? "已拷贝" : "拷贝") {
-                        copy(BeanStore.mcpAddress)
-                        copied = true
-                        Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
+            SettingsGroup(String(localized: "给其他工具用"), footer: String(localized: "命令行入口随时可用。网址入口默认关闭，仅监听 127.0.0.1 且需要令牌鉴权。")) {
+                SettingRow(icon: "network", title: String(localized: "本机网址入口（HTTP MCP）"),
+                           detail: String(localized: "仅给 Grok Bot 等只认网址的工具用，开启后需带令牌访问。")) {
+                    Toggle("本机网址入口（HTTP MCP）", isOn: Binding(
+                        get: { store.settings.httpMCPEnabled },
+                        set: { store.setHTTPMCPEnabled($0) }
+                    ))
+                    .labelsHidden().toggleStyle(.switch)
+                }
+                if store.settings.httpMCPEnabled {
+                    SettingRow(icon: "key", title: String(localized: "接入地址")) {
+                        Text(store.mcpMaskedAddress).font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        Button(copied ? "已拷贝" : "拷贝含令牌地址") {
+                            if let addr = store.mcpAuthenticatedAddress() {
+                                copy(addr)
+                                copied = true
+                                Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
+                            }
+                        }
+                        Button(rotated ? "已重置" : "重置令牌") {
+                            if store.rotateMCPToken() {
+                                rotated = true
+                                Task { try? await Task.sleep(for: .seconds(1.5)); rotated = false }
+                            }
+                        }
                     }
                 }
                 SettingRow(icon: "terminal", title: String(localized: "命令行"), detail: String(localized: "在终端里也能查录音、存内容。")) {

@@ -1,3 +1,4 @@
+import BeanKit
 import Foundation
 import SwiftUI
 
@@ -69,6 +70,13 @@ final class FeishuSync {
     private weak var store: BeanStore?
     private var tool: String?
     private var loop: Task<Void, Never>?
+    private var fillingAudio = false
+    private var audioSkipped: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "feishuAudioSkipped") ?? []) {
+        didSet { UserDefaults.standard.set(Array(audioSkipped), forKey: "feishuAudioSkipped") }
+    }
+    private var audioScopeRetryAt: Date? = UserDefaults.standard.object(forKey: "feishuAudioScopeRetryAt") as? Date {
+        didSet { UserDefaults.standard.set(audioScopeRetryAt, forKey: "feishuAudioScopeRetryAt") }
+    }
 
     func link(for id: UInt32) -> URL? { links[String(id)].flatMap(URL.init(string:)) }
 
@@ -161,7 +169,7 @@ final class FeishuSync {
         lastChecked = .now
         link = .ready
         // 以前只拉回了文字稿的，现在有音频权限就补上
-        if autoPull, !textOnlyImports.isEmpty { await fillAudio() }
+        if autoPull { await fillAudio(automatic: true) }
         let fresh = newOnes
         // 新的默认勾上——只勾最近一天传上去的；更早的（比如几天前的会议）列着，要的话自己勾，免得第一次一下拉回几十条
         let recent = Date.now.addingTimeInterval(-86_400)
@@ -237,22 +245,43 @@ final class FeishuSync {
         imported.values.filter { id in store?.recordings.contains { $0.id == id && $0.textOnly } == true }
     }
 
-    func fillAudio() async {
-        guard let tool, let store, !textOnlyImports.isEmpty else { return }
+    func fillAudio(automatic: Bool = false) async {
+        guard !BeanStore.demo, !fillingAudio, let tool, let store else { return }
+        let eligible = Set(textOnlyImports)
+        guard !eligible.isEmpty else { return }
+        if automatic, let audioScopeRetryAt, audioScopeRetryAt > .now {
+            audioDenied = true
+            return
+        }
+        fillingAudio = true
+        defer { fillingAudio = false }
+
         var done = 0
-        for (token, id) in imported where textOnlyImports.contains(id) {
+        for (token, id) in imported where eligible.contains(id) {
+            if automatic, audioSkipped.contains(token) { continue }
+            guard store.stages[id] == nil, store.recordings.contains(where: { $0.id == id && $0.textOnly }) else { continue }
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("feishu-audio-\(token)", isDirectory: true)
             try? FileManager.default.removeItem(at: dir)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: dir) }
             let dl = await BeanStore.runTool(tool, ["minutes", "+download", "--minute-tokens", token, "--output-dir", ".", "--overwrite", "--format", "json"], cwd: dir) { _ in }
             if let err = Self.reply(dl)?["error"] as? [String: Any] {
-                if (err["subtype"] as? String) == "missing_scope" { audioDenied = true; return }
-                store.addLog("飞书妙记 \(token) 补音频失败：\(err["message"] as? String ?? "")")
+                if (err["subtype"] as? String) == "missing_scope" {
+                    audioDenied = true
+                    audioScopeRetryAt = .now.addingTimeInterval(24 * 60 * 60)
+                    break
+                }
+                let message = err["message"] as? String ?? ""
+                let permanent = message.localizedCaseInsensitiveContains("user lacks permission") ||
+                    message.localizedCaseInsensitiveContains("blocked download URL")
+                if permanent { audioSkipped.insert(token) }
+                store.addLog("飞书妙记 \(token) 补音频失败：\(message)")
                 continue
             }
             guard let audio = Self.firstFile(in: dir, ext: ["m4a", "mp3", "mp4", "aac", "wav", "ogg", "webm", "opus", "mov"]) else { continue }
             audioDenied = false
+            audioScopeRetryAt = nil
+            if audioSkipped.contains(token) { audioSkipped.remove(token) }
             if await store.attachFeishuAudio(audio, to: id) { done += 1 }
         }
         if done > 0 { store.announce("waveform", String(localized: "给 \(done) 条飞书录音补上了音频"), body: String(localized: "正在重新转写，转完就能点句子回听。")) }
@@ -356,16 +385,28 @@ extension BeanStore {
     private func feishuTitle(_ m: FeishuSync.Minute) -> String? { m.recorded == nil ? m.title : nil }
 
     func importFeishuAudio(_ file: URL, minute m: FeishuSync.Minute) async -> UInt32? {
-        let samples = await Task.detached { BeanStore.decodeAnyAudio(file) }.value
-        guard let samples, samples.count > 1600 else { addLog("飞书妙记 \(m.id) 的音频解不开"); return nil }
-        let id = freshID(near: m.start)
-        do { try QwenASR.wav(samples).write(to: wavURL(id), options: .atomic) } catch { addLog("飞书妙记写不进磁盘：\(error.localizedDescription)"); return nil }
-        var rec = Recording(id: id, size: UInt32(samples.count * 2), date: m.start, duration: Double(samples.count) / 16000)
-        rec.downloaded = true; rec.origin = Self.feishuOrigin; rec.title = feishuTitle(m)
-        insertImported(rec)
-        addLog("从飞书妙记拉回音频 \(m.id) → \(id)")
-        if settings.autoProcess { process(id) }
-        return id
+        let id = allocateRecordingID(near: m.start)
+        defer { reservedImportIDs.remove(id) }
+        let dest = wavURL(id)
+        do {
+            let result = try await Task.detached(priority: .userInitiated) {
+                try AudioStream.transcodeToMono16kWAV(from: file, to: dest, minSamples: 1601)
+            }.value
+            var rec = Recording(id: id, size: UInt32(clamping: result.byteSize), date: m.start, duration: result.duration)
+            rec.downloaded = true; rec.origin = Self.feishuOrigin; rec.title = feishuTitle(m)
+            insertImported(rec)
+            addLog("从飞书妙记拉回音频 \(m.id) → \(id)")
+            if settings.autoProcess { process(id) }
+            return id
+        } catch AudioStreamError.unreadable, AudioStreamError.tooShort {
+            try? FileManager.default.removeItem(at: dest)
+            addLog("飞书妙记 \(m.id) 的音频解不开")
+            return nil
+        } catch {
+            try? FileManager.default.removeItem(at: dest)
+            addLog("飞书妙记写不进磁盘：\(error.localizedDescription)")
+            return nil
+        }
     }
 
     func importFeishuText(_ text: String, minute m: FeishuSync.Minute) -> UInt32? {
@@ -385,14 +426,31 @@ extension BeanStore {
 
     /// 给只有文字稿的飞书录音补上音频：写 wav、不再是纯文字，重新转写（纪要、标题、标签照常更新）。
     func attachFeishuAudio(_ file: URL, to id: UInt32) async -> Bool {
-        let samples = await Task.detached { BeanStore.decodeAnyAudio(file) }.value
         // 正在处理（转写或整理）的先不动：process 会因为它在队列里直接返回，补上的音频就没被转写，以后也不会再补
         guard stages[id] == nil else { addLog("飞书录音 \(id) 正在处理，等处理完再补音频"); return false }
-        guard let samples, samples.count > 1600, let i = recordings.firstIndex(where: { $0.id == id }) else { return false }
-        do { try QwenASR.wav(samples).write(to: wavURL(id), options: .atomic) } catch { return false }
+        guard recordings.contains(where: { $0.id == id }) else { return false }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("beanpod-feishu-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let result: WAVWriteResult
+        do {
+            result = try await Task.detached(priority: .userInitiated) {
+                try AudioStream.transcodeToMono16kWAV(from: file, to: tmp, minSamples: 1601)
+            }.value
+        } catch {
+            return false
+        }
+        guard stages[id] == nil, let i = recordings.firstIndex(where: { $0.id == id }) else { return false }
+        let dest = wavURL(id)
+        do {
+            if FileManager.default.fileExists(atPath: dest.path) {
+                _ = try FileManager.default.replaceItemAt(dest, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: dest)
+            }
+        } catch { return false }
         recordings[i].textOnly = false
-        recordings[i].duration = Double(samples.count) / 16000
-        recordings[i].size = UInt32(samples.count * 2)
+        recordings[i].duration = result.duration
+        recordings[i].size = UInt32(clamping: result.byteSize)
         saveLibrary()
         addLog("飞书录音 \(id) 补上音频，重新转写")
         process(id, retranscribe: true)

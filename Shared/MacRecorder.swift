@@ -1,4 +1,5 @@
 import AVFoundation
+import BeanKit
 #if os(macOS)
 import AppKit
 #else
@@ -158,23 +159,22 @@ extension BeanStore {
             if let reason = tap?.error { addLog("系统声音采集中途报错：\(reason)") }
             // 把两路声音合成一个文件：各自解成 16 kHz 单声道，按开始时间对齐后相加
             let micURL = recorder?.url, systemURL = tap?.url, systemStarted = tap?.startedAt
-            let mixed: URL? = await Task.detached {
-                let mic = micURL.flatMap { Self.decodeAnyAudio($0) } ?? []
-                var system = systemURL.flatMap { Self.decodeAnyAudio($0) } ?? []
-                if let a = micStarted, let b = systemStarted, !mic.isEmpty, !system.isEmpty {
-                    // 系统那一路开始得晚就在前面补静音，开始得早就把多出来的头去掉
-                    let offset = Int(b.timeIntervalSince(a) * 16000)
-                    if offset > 0 { system = [Float](repeating: 0, count: offset) + system }
-                    else if offset < 0 { system = Array(system.dropFirst(min(-offset, system.count))) }
-                }
-                let count = max(mic.count, system.count)
-                guard count > 1600 else { return nil }
-                var out = [Float](repeating: 0, count: count)
-                for i in 0..<mic.count { out[i] += mic[i] }
-                for i in 0..<system.count { out[i] += system[i] }
-                if !mic.isEmpty, !system.isEmpty { for i in 0..<count { out[i] = max(-1, min(1, out[i])) } }
+            let offsetSamples: Int
+            if let a = micStarted, let b = systemStarted {
+                offsetSamples = Int(b.timeIntervalSince(a) * Double(AudioStream.sampleRate))
+            } else {
+                offsetSamples = 0
+            }
+            let mixed: URL? = await Task.detached(priority: .userInitiated) {
+                guard micURL != nil || systemURL != nil else { return nil }
                 let url = FileManager.default.temporaryDirectory.appendingPathComponent("beanpod-mac-\(UUID().uuidString).wav")
-                return (try? QwenASR.wav(out).write(to: url, options: .atomic)) != nil ? url : nil
+                do {
+                    _ = try AudioStream.mixToMono16kWAV(micURL: micURL, systemURL: systemURL, systemOffsetSamples: offsetSamples, to: url, minSamples: 1601)
+                    return url
+                } catch {
+                    try? FileManager.default.removeItem(at: url)
+                    return nil
+                }
             }.value
             for u in [micURL, systemURL].compactMap({ $0 }) { try? FileManager.default.removeItem(at: u) }
             guard let mixed else {
@@ -182,11 +182,10 @@ extension BeanStore {
                                   detail: source.usesSystem ? String(localized: "电脑里这段时间没有播放任何声音，或者系统没有把声音交给豆仓。") : String(localized: "麦克风没有录到内容。"))
                 return
             }
-            let before = Set(recordings.map(\.id))
             // 开着「录完先问一句」时先不整理，等用户说留着再整理
-            importFile(mixed, consume: true, processNow: !settings.askKeep)
+            guard let rid = await importFileAsync(mixed, consume: true, processNow: !settings.askKeep) else { return }
             // 刚导进来的那一条：标上来源和重点标记，标题留空（先显示时间，整理完会自动起名）
-            if let i = recordings.firstIndex(where: { !before.contains($0.id) }) {
+            if let i = recordings.firstIndex(where: { $0.id == rid }) {
                 recordings[i].origin = Self.deviceShort + " · " + source.storedName
                 recordings[i].title = nil
                 recordings[i].marks = marks.filter { $0 <= recordings[i].duration + 1 }

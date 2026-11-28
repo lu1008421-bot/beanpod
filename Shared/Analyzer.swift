@@ -1,3 +1,4 @@
+import BeanKit
 import Foundation
 
 nonisolated struct Analysis: Sendable {
@@ -9,6 +10,18 @@ nonisolated struct Analysis: Sendable {
     var tags: [String]
     var people: [String]
     var source: String
+}
+
+nonisolated struct LLMChatResult: Sendable {
+    var content: String
+    var usage: LLMTokenUsage
+    var config: LLMConfig
+}
+
+nonisolated struct DetailedAnalysis: Sendable {
+    var analysis: Analysis
+    var usage: LLMTokenUsage
+    var config: LLMConfig
 }
 
 nonisolated enum AnalyzerError: LocalizedError {
@@ -30,6 +43,10 @@ nonisolated struct LLMConfig: Sendable {
     var key: String
     /// 豆仓自己起的本机模型。
     var builtIn = false
+
+    var providerHost: String {
+        builtIn ? "127.0.0.1" : LLMRouteEndpoint(baseURL: baseURL, model: model, key: key).providerHost
+    }
 }
 
 /// 把文字稿整理成：场景、标题、摘要、分栏要点、待办、标签、人物。
@@ -37,6 +54,10 @@ nonisolated enum Analyzer {
     // MARK: 调模型
 
     static func chat(_ config: LLMConfig, system: String, user: String, json: Bool) async throws -> String {
+        try await chatDetailed(config, system: system, user: user, json: json).content
+    }
+
+    static func chatDetailed(_ config: LLMConfig, system: String, user: String, json: Bool) async throws -> LLMChatResult {
         guard let url = URL(string: config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")) + "/chat/completions") else {
             throw AnalyzerError.notConfigured
         }
@@ -64,7 +85,13 @@ nonisolated enum Analyzer {
               let content = message["content"] as? String else {
             throw AnalyzerError.badReply(String(localized: "没有 choices"))
         }
-        return stripThinking(content)
+        let cleaned = stripThinking(content)
+        let usage = LLMTokenUsage.parse(
+            responseJSONData: data,
+            promptText: system + "\n" + user,
+            completionText: cleaned
+        )
+        return LLMChatResult(content: cleaned, usage: usage, config: config)
     }
 
     /// 有些模型会把思考过程包在 <think> 里一起吐出来，去掉。
@@ -88,21 +115,32 @@ nonisolated enum Analyzer {
 
     // MARK: 整理
 
-    static func analyze(transcript: String, duration: TimeInterval, profession: Profession, fixedScene: Scene?,
-                        config: LLMConfig) async throws -> Analysis {
-        // 长录音先分块压成要点，再整体整理，避免超出模型的上下文
-        var material = transcript
-        if transcript.count > 9000 {
-            var notes: [String] = []
-            for (i, chunk) in split(transcript, size: 6000).enumerated() {
-                let note = try await chat(config,
-                    system: "你在帮人整理一段长录音的文字稿。这是其中第 \(i + 1) 段。用\(NotesLanguage.promptName)列出这一段里的事实、观点、数字、人名、约定和待办，每条一行，不要评论，不要编造。",
-                    user: chunk, json: false)
-                notes.append("【第 \(i + 1) 段】\n" + note)
-            }
-            material = notes.joined(separator: "\n\n")
-        }
+    static func summarizeChunk(index: Int, chunk: String, config: LLMConfig) async throws -> LLMChatResult {
+        try await chatDetailed(config,
+            system: "你在帮人整理一段长录音的文字稿。这是其中第 \(index + 1) 段。用\(NotesLanguage.promptName)列出这一段里的事实、观点、数字、人名、约定和待办，每条一行，不要评论，不要编造。",
+            user: chunk, json: false)
+    }
 
+    static func prepareAnalysisMaterial(
+        transcript: String,
+        summarizeWith: @Sendable (Int, String) async throws -> String
+    ) async throws -> String {
+        guard transcript.count > 9000 else { return transcript }
+        var notes: [String] = []
+        for (i, chunk) in split(transcript, size: 6000).enumerated() {
+            let note = try await summarizeWith(i, chunk)
+            notes.append("【第 \(i + 1) 段】\n" + note)
+        }
+        return notes.joined(separator: "\n\n")
+    }
+
+    static func synthesizeDetailed(
+        material: String,
+        duration: TimeInterval,
+        profession: Profession,
+        fixedScene: Scene?,
+        config: LLMConfig
+    ) async throws -> DetailedAnalysis {
         let sceneGuide = Scene.allCases.map { "- \($0.rawValue)（\($0.promptName)）：\($0.definition)。栏目：\($0.headings.joined(separator: "、"))" }
             .joined(separator: "\n")
         let sceneRule = fixedScene.map { "场景已经确定是 \($0.rawValue)，不要改。" }
@@ -130,8 +168,23 @@ nonisolated enum Analyzer {
         - \(NotesLanguage.rule)
         """
         let user = "录音时长：\(promptDuration(duration))\n\n文字稿：\n\(material)"
-        let reply = try await chat(config, system: system, user: user, json: true)
-        return try parse(reply, fixedScene: fixedScene, source: config.model)
+        let res = try await chatDetailed(config, system: system, user: user, json: true)
+        let analysis = try parse(res.content, fixedScene: fixedScene, source: config.model)
+        return DetailedAnalysis(analysis: analysis, usage: res.usage, config: config)
+    }
+
+    static func analyze(transcript: String, duration: TimeInterval, profession: Profession, fixedScene: Scene?,
+                        config: LLMConfig) async throws -> Analysis {
+        let material = try await prepareAnalysisMaterial(transcript: transcript) { i, chunk in
+            try await summarizeChunk(index: i, chunk: chunk, config: config).content
+        }
+        return try await synthesizeDetailed(
+            material: material,
+            duration: duration,
+            profession: profession,
+            fixedScene: fixedScene,
+            config: config
+        ).analysis
     }
 
     static func parse(_ reply: String, fixedScene: Scene?, source: String) throws -> Analysis {
@@ -194,9 +247,15 @@ nonisolated enum Analyzer {
     static func polish(_ lines: [String], config: LLMConfig) async throws -> [String] {
         var out: [String] = []
         for batch in stride(from: 0, to: lines.count, by: 30).map({ Array(lines[$0..<min($0 + 30, lines.count)]) }) {
-            let numbered = batch.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
-            let reply = try await chat(config,
-                system: """
+            out += try await polishBatch(batch, config: config).lines
+        }
+        return out
+    }
+
+    static func polishBatch(_ batch: [String], config: LLMConfig) async throws -> (lines: [String], usage: LLMTokenUsage) {
+        let numbered = batch.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+        let res = try await chatDetailed(config,
+            system: """
                 下面是一段录音的逐句文字稿，每行一句，前面有编号。请逐句整理成通顺的书面文字：
                 - 去掉语气词和口头禅：呃、嗯、啊、哎、然后呢、就是、就是说、这个、那个、对应的、的话、怎么说呢、对吧。它们只是说话时的垫词时一律删掉；「这个」「那个」确实在指代东西时保留\n                - 去掉结巴和重复（「我我我」「去去去」「减减少」），一句话里说了两遍的意思只留一遍\n                - 说到一半改口的，只留改口之后的说法
                 - 补好标点，改掉明显的同音错字
@@ -204,21 +263,20 @@ nonisolated enum Analyzer {
                 - 一句话被上下两行截断时，各行保持各自的内容，不要挪到别的行
                 只输出一个 JSON 对象：{"lines": ["第 1 句整理后", "第 2 句整理后", …]}，数组长度必须和输入的行数相同。
                 """,
-                user: numbered, json: true)
-            guard let a = reply.firstIndex(of: "{"), let b = reply.lastIndex(of: "}"),
-                  let obj = try? JSONSerialization.jsonObject(with: Data(reply[a...b].utf8)) as? [String: Any],
-                  let cleaned = obj["lines"] as? [String], cleaned.count == batch.count else {
-                throw AnalyzerError.badReply(String(localized: "润色结果的句数对不上"))
-            }
-            out += cleaned.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            user: numbered, json: true)
+        let reply = res.content
+        guard let a = reply.firstIndex(of: "{"), let b = reply.lastIndex(of: "}"),
+              let obj = try? JSONSerialization.jsonObject(with: Data(reply[a...b].utf8)) as? [String: Any],
+              let cleaned = obj["lines"] as? [String], cleaned.count == batch.count else {
+            throw AnalyzerError.badReply(String(localized: "润色结果的句数对不上"))
         }
-        return out
+        return (cleaned.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }, res.usage)
     }
 
     // MARK: 改写
 
-    static func rewrite(material: String, instruction: String, profession: Profession, config: LLMConfig) async throws -> String {
-        try await chat(config,
+    static func rewriteDetailed(material: String, instruction: String, profession: Profession, config: LLMConfig) async throws -> LLMChatResult {
+        try await chatDetailed(config,
             system: """
             你是一位文字编辑。使用者的职业是「\(profession.promptName)」。下面是他一段录音的内容，请按要求改写。
             要求：\(instruction)
@@ -228,13 +286,21 @@ nonisolated enum Analyzer {
             user: material, json: false)
     }
 
+    static func rewrite(material: String, instruction: String, profession: Profession, config: LLMConfig) async throws -> String {
+        try await rewriteDetailed(material: material, instruction: instruction, profession: profession, config: config).content
+    }
+
     // MARK: 问知识库
 
-    static func answer(question: String, context: [(title: String, text: String)], config: LLMConfig) async throws -> String {
+    static func answerDetailed(question: String, context: [(title: String, text: String)], config: LLMConfig) async throws -> LLMChatResult {
         let material = context.enumerated().map { "[\($0.offset + 1)]《\($0.element.title)》\n\($0.element.text)" }.joined(separator: "\n\n")
-        return try await chat(config,
+        return try await chatDetailed(config,
             system: "你根据用户自己的录音记录回答问题。只用下面给出的材料，材料里没有就直说没有记录到，不要编。回答简洁，用提问所用的语言回答，在相关句子后面用 [编号] 标出依据。",
             user: "材料：\n\(material)\n\n问题：\(question)", json: false)
+    }
+
+    static func answer(question: String, context: [(title: String, text: String)], config: LLMConfig) async throws -> String {
+        try await answerDetailed(question: question, context: context, config: config).content
     }
 }
 

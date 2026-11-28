@@ -44,7 +44,7 @@ enum Assistant: String, CaseIterable, Identifiable {
         case .claudeDesktop: String(localized: "改 ~/Library/Application Support/Claude/claude_desktop_config.json，改之前会留一份备份。要在 Claude 完全退出的时候连")
         case .codex: String(localized: "用 codex 命令添加，写在 ~/.codex/config.toml")
         case .openclaw: String(localized: "用 openclaw 命令添加，写在 ~/.openclaw/openclaw.json")
-        case .grok: String(localized: "Grok Bot 只认网址：拷贝豆仓的地址，到它的设置里粘贴。豆仓要开着才连得上")
+        case .grok: String(localized: "Grok Bot 只认网址：需要先开启本机网址入口，再把含令牌的地址粘贴到它的设置里。豆仓要开着才连得上")
         }
     }
 
@@ -135,7 +135,7 @@ final class Connector {
         states = next
     }
 
-    func connect(_ a: Assistant) async {
+    func connect(_ a: Assistant, store: BeanStore) async {
         guard cliInstalled else { notes[a] = (false, String(localized: "豆仓的命令行工具还没装好，连不了。")); return }
         busy.insert(a); defer { busy.remove(a) }
         let cli = "'\(Self.cli)'"
@@ -159,10 +159,19 @@ final class Connector {
             notes[a] = editDesktopConfig { servers in servers["beanpod"] = ["command": Self.cli, "args": ["mcp"]] }
                 ? (true, String(localized: "接上了。现在打开 Claude 就能用。")) : (false, String(localized: "没能改 Claude 的设置文件。"))
         case .grok:
+            if !store.settings.httpMCPEnabled {
+                store.setHTTPMCPEnabled(true)
+            } else if !store.mcpServerRunning {
+                store.startMCPServer()
+            }
+            guard let addr = store.mcpAuthenticatedAddress() else {
+                notes[a] = (false, String(localized: "无法生成本机访问令牌，请检查系统钥匙串权限。"))
+                return
+            }
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(BeanStore.mcpAddress, forType: .string)
+            NSPasteboard.general.setString(addr, forType: .string)
             NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Grok Bot.app"))
-            notes[a] = (true, String(localized: "地址已经拷贝，Grok Bot 也打开了。到它的设置里添加一个 MCP，把地址粘贴进去。"))
+            notes[a] = (true, String(localized: "已开启本机网址入口并拷贝含令牌地址，Grok Bot 也打开了。到它的设置里添加一个 MCP，把地址粘贴进去。"))
         }
         await refresh()
     }
@@ -188,7 +197,7 @@ final class Connector {
     }
 
     /// 试一下：豆仓这边的入口通不通；Claude Code 还能问它自己连上没有。
-    func test(_ a: Assistant) async {
+    func test(_ a: Assistant, store: BeanStore) async {
         busy.insert(a); defer { busy.remove(a) }
         // 像助手那样给豆仓发一次握手，再要一次工具清单
         let hello = #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"beanpod-test","version":"1"}}}"#
@@ -205,9 +214,31 @@ final class Connector {
             notes[a] = r.output.contains("Connected") ? (true, String(localized: "通了：Claude Code 报告已连接，豆仓给了它 \(max(tools - 1, 1)) 个可用的动作。"))
                 : (false, String(localized: "豆仓这边正常，但 Claude Code 说没连上：\(Self.tail(r.output))"))
         case .grok:
-            let r = await Self.shell("curl -s -m 4 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '\(list)' \(BeanStore.mcpAddress)")
-            notes[a] = r.output.contains("200") ? (true, String(localized: "豆仓的网址入口是通的。Grok Bot 那边有没有填对，要在它里面问一句才知道。"))
-                : (false, String(localized: "豆仓的网址入口没应答，重开一次豆仓再试。"))
+            guard store.settings.httpMCPEnabled else {
+                notes[a] = (false, String(localized: "本机网址入口还没开启。请先打开下方「本机网址入口」开关，再试一次。"))
+                return
+            }
+            if !store.mcpServerRunning { store.startMCPServer() }
+            let token = store.mcpToken(createIfMissing: false)
+            guard !token.isEmpty, let url = URL(string: BeanStore.mcpAddress) else {
+                notes[a] = (false, String(localized: "本机访问令牌还没就绪，请尝试重置令牌后再试。"))
+                return
+            }
+            var req = URLRequest(url: url, timeoutInterval: 4)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            req.httpBody = Data(list.utf8)
+            let ok: Bool
+            if let (data, resp) = try? await URLSession.shared.data(for: req),
+               (resp as? HTTPURLResponse)?.statusCode == 200,
+               String(decoding: data, as: UTF8.self).contains("search_recordings") {
+                ok = true
+            } else {
+                ok = false
+            }
+            notes[a] = ok ? (true, String(localized: "豆仓的网址入口是通的（已通过令牌校验）。Grok Bot 那边有没有填对，要在它里面问一句才知道。"))
+                : (false, String(localized: "豆仓的网址入口没应答，可以试一下关掉再重开开关。"))
         default:
             notes[a] = (true, String(localized: "豆仓这边的入口是通的。\(a.name) 那边要新开一个会话问一句才算真的验证。"))
         }
@@ -272,13 +303,44 @@ struct ConnectView: View {
                 Text("创作工具").font(.system(size: 20, weight: .semibold, design: .rounded)).padding(.top, 8)
                 RenoiseCard()
 
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text("别的工具").font(.headline)
-                    Text("支持 MCP 的工具都能接。能运行命令的填：").font(.callout).foregroundStyle(.secondary)
+                    Text("支持 MCP 的工具都能接。能运行命令的填（推荐）：").font(.callout).foregroundStyle(.secondary)
                     copyRow(BeanStore.cliPath + " mcp")
-                    Text("只认网址的填（豆仓开着时才有）：").font(.callout).foregroundStyle(.secondary)
-                    copyRow(BeanStore.mcpAddress)
-                    Text("这两个入口都只在这台 Mac 上有效，录音不会经过别的服务器。助手拿到内容之后怎么处理，取决于那个助手自己。")
+                    Toggle("本机网址入口（HTTP MCP，默认关闭）：", isOn: Binding(
+                        get: { store.settings.httpMCPEnabled },
+                        set: { store.setHTTPMCPEnabled($0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .font(.callout)
+                    .padding(.top, 4)
+                    if store.settings.httpMCPEnabled {
+                        HStack(spacing: 8) {
+                            Text(store.mcpMaskedAddress).font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Button("拷贝含令牌地址") {
+                                if let addr = store.mcpAuthenticatedAddress() {
+                                    copy(addr)
+                                    store.toast("doc.on.doc", String(localized: "已拷贝含令牌地址"))
+                                } else {
+                                    store.toast("exclamationmark.triangle", String(localized: "获取本机令牌失败"))
+                                }
+                            }
+                            Button("重置令牌") {
+                                if store.rotateMCPToken() {
+                                    store.toast("key.fill", String(localized: "令牌已重置，旧地址已失效"))
+                                } else {
+                                    store.toast("exclamationmark.triangle", String(localized: "重置令牌失败"))
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .background(.quaternary.opacity(0.45), in: .rect(cornerRadius: Theme.Radius.card))
+                    } else {
+                        Text("为防止本机浏览器网页越权访问，网址入口默认关闭；仅当 Grok Bot 等只认网址的工具需要时再开启。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text("两个入口都只在这台 Mac 上有效，HTTP 入口只监听 127.0.0.1 并要求访问令牌。助手拿到内容之后怎么处理，取决于那个助手自己。")
                         .font(.caption).foregroundStyle(.tertiary).padding(.top, 2)
                 }
                 .padding(16).frame(maxWidth: .infinity, alignment: .leading).panel()
@@ -323,11 +385,11 @@ struct ConnectView: View {
                 if busy { ProgressView().controlSize(.small) }
                 if state.installed {
                     if state.connected == true {
-                        Button("试一下") { Task { await connector.test(a) } }.disabled(busy)
+                        Button("试一下") { Task { await connector.test(a, store: store) } }.disabled(busy)
                         Button("断开") { Task { await connector.disconnect(a) } }.disabled(busy)
                     } else {
-                        if a == .grok { Button("试一下") { Task { await connector.test(a) } }.disabled(busy) }
-                        Button(a == .grok ? "拷贝地址并打开" : "连接") { Task { await connector.connect(a) } }
+                        if a == .grok { Button("试一下") { Task { await connector.test(a, store: store) } }.disabled(busy) }
+                        Button(a == .grok ? "拷贝地址并打开" : "连接") { Task { await connector.connect(a, store: store) } }
                             .buttonStyle(.glassProminent).disabled(busy || !connector.cliInstalled)
                     }
                 }

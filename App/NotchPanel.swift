@@ -8,7 +8,7 @@ import SwiftUI
 /// - 平时和刘海一样大、一样黑，看不出来；录音时刘海两边伸出两只「耳朵」：左边红点和计时，右边声波。
 /// - 鼠标移上去就往下展开：设备状态、一键开始录音、用这台 Mac 录、剪贴板里认出来的视频链接一键导入、下载进度。
 ///   移开就收起；点一下会固定展开，再点别处收起。
-/// - 没有刘海的屏幕（外接显示器、老机型）在菜单栏正中放一个同样样式的小胶囊。
+/// - 没有刘海的屏幕（外接显示器、老机型）在菜单栏正中下方挂一个同样样式的小胶囊，不盖住菜单栏上的图标。
 /// 不抢焦点：点面板上的按钮不会把豆仓切到前台。
 @MainActor @Observable
 final class NotchPanel {
@@ -110,14 +110,17 @@ final class NotchPanel {
         if lastSize != .zero { resize(lastSize, animated: false) }
     }
 
-    /// 窗口顶边贴着屏幕顶边、水平居中。
+    /// 水平居中。有刘海：顶边贴着屏幕顶边，和刘海连成一块。
+    /// 没有刘海：菜单栏正中也可能排着别的 App 的图标，所以贴在菜单栏下边，收起、展开都不盖住菜单栏（#4）。
     func resize(_ size: CGSize, animated: Bool = true) {
         lastSize = size
         let animated = animated && !instantResize
         instantResize = false
         guard let window, let screen else { return }
         let f = screen.frame
-        let frame = NSRect(x: (f.midX - size.width / 2).rounded(), y: f.maxY - size.height, width: size.width, height: size.height)
+        // 菜单栏设成自动隐藏时 visibleFrame 顶到屏幕顶边，这里就是 0
+        let top = hasNotch ? f.maxY : min(f.maxY, screen.visibleFrame.maxY)
+        let frame = NSRect(x: (f.midX - size.width / 2).rounded(), y: top - size.height, width: size.width, height: size.height)
         guard frame != window.frame else { return }
         if animated {
             NSAnimationContext.runAnimationGroup { ctx in
@@ -276,7 +279,8 @@ struct NotchView: View {
         case nil: break
         }
         if panel.expanded {
-            var h = n.height + 84
+            // 没有刘海时面板挂在菜单栏下面，顶上不用再让出一段
+            var h = (panel.hasNotch ? n.height : 12) + 84
             if panel.clip != nil { h += 66 }
             if job != nil { h += 40 }
             return CGSize(width: max(360, n.width + 170), height: h)
@@ -323,7 +327,7 @@ struct NotchView: View {
 
     private var expandedContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Color.clear.frame(height: max(0, panel.notchSize.height - 10))     // 让开刘海和摄像头
+            Color.clear.frame(height: panel.hasNotch ? max(0, panel.notchSize.height - 10) : 2)     // 让开刘海和摄像头
             header
             controls
             if let clip = panel.clip { clipCard(clip) }

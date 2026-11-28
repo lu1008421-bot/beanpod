@@ -1,3 +1,4 @@
+import BeanKit
 import Foundation
 
 /// 英语学习模式整理出来的东西（设计稿 design/ui/ui_study.png）：难度概览、重点单词（带等级）、短语搭配、难句解析。
@@ -83,8 +84,9 @@ extension BeanStore {
         Task {
             defer { studying.remove(id) }
             do {
-                let (reply, model) = try await withLLM { config in
-                    (try await Analyzer.chat(config, system: Self.studyPrompt, user: excerpt, json: true), config.model)
+                let (reply, model) = try await withLLM(task: .study, tier: .primary, recordingID: id) { config in
+                    let res = try await Analyzer.chatDetailed(config, system: Self.studyPrompt, user: excerpt, json: true)
+                    return ((res.content, config.model), res.usage)
                 }
                 var s = try Self.parseStudy(Analyzer.stripThinking(reply))
                 s.model = model

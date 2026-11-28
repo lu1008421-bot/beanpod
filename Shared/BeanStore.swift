@@ -163,6 +163,8 @@ final class BeanStore {
     var serverInstall: String?
     var localLLMReady = false
     var asrAvailable = false
+    var polishing: Set<UInt32> = []
+    var usageEntries: [LLMUsageEntry] = []
 
     // 知识库问答
     var answer: String?
@@ -267,6 +269,14 @@ final class BeanStore {
     @ObservationIgnored var retranscribing: Set<UInt32> = []
     /// 这几条重新转写时走云端（录音页「交给云端重转」），不管平时用哪个引擎。
     @ObservationIgnored var viaCloud: Set<UInt32> = []
+    @ObservationIgnored var importingFiles: Set<String> = []
+    @ObservationIgnored var reservedImportIDs: Set<UInt32> = []
+    var importingCount = 0
+    #if os(macOS)
+    @ObservationIgnored var mcpServerProcess: Process?
+    @ObservationIgnored var mcpTerminateObserver: NSObjectProtocol?
+    var mcpServerRunning = false
+    #endif
 
     private struct PullJob {
         let id: UInt32
@@ -330,10 +340,17 @@ final class BeanStore {
         loadPeople()
         // 人物卡上次关闭前可能改过名/合并过：启动时把录音里的说话人标签和人物名单对齐一次
         syncPeopleToLibrary()
+        loadUsageLedger()
         refreshASRAvailability()
         watchInbox()
         #if os(macOS)
-        if !Self.demo { installCLI(); startMCPServer() }
+        if !Self.demo {
+            installCLI()
+            if settings.httpMCPEnabled { startMCPServer() }
+            mcpTerminateObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.stopMCPServer() }
+            }
+        }
         #endif
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))
@@ -1058,6 +1075,43 @@ final class BeanStore {
     func oggURL(_ id: UInt32) -> URL { folder.appendingPathComponent("\(id).ogg") }
     func wavURL(_ id: UInt32) -> URL { folder.appendingPathComponent("\(id).wav") }
     private var libraryURL: URL { folder.appendingPathComponent("library.json") }
+    var usageLedgerURL: URL { folder.appendingPathComponent("llm_usage.json") }
+
+    var usageSummary: LLMUsageSummary { LLMUsageLedger.summarize(usageEntries) }
+
+    private func loadUsageLedger() {
+        usageEntries = LLMUsageLedger.load(from: usageLedgerURL)
+    }
+
+    func clearUsageLedger() {
+        usageEntries = []
+        try? FileManager.default.removeItem(at: usageLedgerURL)
+    }
+
+    func recordLLMUsage(
+        task: LLMTaskKind,
+        tier: LLMTier,
+        config: LLMConfig,
+        recordingID: UInt32? = nil,
+        usage: LLMTokenUsage
+    ) {
+        let entry = LLMUsageEntry(
+            task: task,
+            tier: tier,
+            model: config.model,
+            providerHost: config.providerHost,
+            builtInLocal: config.builtIn,
+            recordingID: recordingID,
+            usage: usage
+        )
+        usageEntries = LLMUsageLedger.append(entry, to: usageEntries)
+        try? LLMUsageLedger.save(usageEntries, to: usageLedgerURL)
+        if let recordingID, usage.totalTokens > 0,
+           let i = recordings.firstIndex(where: { $0.id == recordingID }) {
+            recordings[i].llmTokens += usage.totalTokens
+            saveLibrary()
+        }
+    }
 
     private func loadLibrary() {
         guard let data = try? Data(contentsOf: libraryURL),
@@ -1087,8 +1141,18 @@ final class BeanStore {
         moveToTrash(id)
     }
 
+    func audioFileURL(for id: UInt32) -> URL? {
+        AudioStream.preferredAudioURL(ogg: oggURL(id), wav: wavURL(id))
+    }
+
     #if os(macOS)
-    func reveal(_ id: UInt32) { NSWorkspace.shared.activateFileViewerSelecting([oggURL(id)]) }
+    func reveal(_ id: UInt32) {
+        if let url = audioFileURL(for: id) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            toast("exclamationmark.triangle", String(localized: "找不到这条录音的音频文件"))
+        }
+    }
     #endif
 
     /// 连上录音豆时「叮」一声。手机上用一下轻震代替。
@@ -1277,17 +1341,37 @@ final class BeanStore {
         }
     }
 
+    private static let logByteLimit = 5 * 1024 * 1024
     @ObservationIgnored private let logFile: FileHandle? = {
-        let url = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs/BeanPod.log")
-        if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
-        let handle = try? FileHandle(forWritingTo: url)
-        _ = try? handle?.seekToEnd()
-        return handle
+        let fm = FileManager.default
+        let directory = fm.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs")
+        let url = directory.appendingPathComponent(BeanStore.demo ? "BeanPod-Demo.log" : "BeanPod.log")
+        do {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !fm.fileExists(atPath: url.path) { try Data().write(to: url, options: .withoutOverwriting) }
+            return try FileHandle(forWritingTo: url)
+        } catch {
+            NSLog("豆仓无法打开日志文件：%@", error.localizedDescription)
+            return nil
+        }
     }()
 
     func addLog(_ line: String) {
         let stamped = "\(Date.now.formatted(date: .omitted, time: .standard))  \(line)"
-        logFile?.write(Data((stamped + "\n").utf8))
+        if let logFile {
+            var entry = Data((stamped + "\n").utf8)
+            if entry.count > Self.logByteLimit { entry = Data("豆仓日志单行超过大小上限\n".utf8) }
+            do {
+                let size = try logFile.seekToEnd()
+                if size > UInt64(Self.logByteLimit - entry.count) {
+                    try logFile.truncate(atOffset: 0)
+                    try logFile.seek(toOffset: 0)
+                }
+                try logFile.write(contentsOf: entry)
+            } catch {
+                NSLog("豆仓无法写入日志文件：%@", error.localizedDescription)
+            }
+        }
         log.append(stamped)
         if log.count > 400 { log.removeFirst(log.count - 400) }
     }
