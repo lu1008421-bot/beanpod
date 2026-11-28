@@ -34,6 +34,10 @@ nonisolated enum SpeakerMatcher {
     static let minMargin: Float = 0.08
     /// 没认出的声音至少说够这么久（清晰、非交叠）才建待认识卡；更短的只留录音内标签。
     static let minStrangerSeconds: Double = 30
+    /// 是否允许自动落库署名。**第 4 节真实多天样本阈值校准通过前保持关闭**：
+    /// 关闭时即使分数 ≥ `autoThreshold` 且间距足够，也只降到「建议确认」，绝不自动署名，
+    /// 用户点「就是 TA」后才归属并入库确认样本。
+    static let autoAssignEnabled = false
 
     /// 若干归一化向量的中心（再归一化）。
     static func centroid(_ vectors: [[Float]]) -> [Float]? {
@@ -69,7 +73,8 @@ nonisolated enum SpeakerMatcher {
     ///   - candidates: 候选人物中心向量。
     ///   - rejectedKeys: 已驳回的「人物↔声音」对，命中则跳过该候选（防止反复推荐）。
     ///   - rejectedKey: 由候选 personID 生成驳回键。
-    static func match(centroid: [Float], candidates: [SpeakerCandidate], rejectedKeys: Set<String>, rejectedKey: (UUID) -> String) -> SpeakerMatchResult {
+    ///   - allowAuto: 是否允许返回 `.auto`（自动落库署名）。默认取 `autoAssignEnabled`（当前为关）。
+    static func match(centroid: [Float], candidates: [SpeakerCandidate], rejectedKeys: Set<String>, rejectedKey: (UUID) -> String, allowAuto: Bool = autoAssignEnabled) -> SpeakerMatchResult {
         let scored = candidates
             .map { c -> (SpeakerCandidate, Float) in (c, cosine(centroid, c.centroid)) }
             .sorted { $0.1 > $1.1 }
@@ -78,7 +83,7 @@ nonisolated enum SpeakerMatcher {
             return SpeakerMatchResult(tier: .newPerson, personID: nil, score: 0, secondScore: 0, topCandidateID: nil)
         }
         let second = allowed.dropFirst().first?.1 ?? -1
-        if best.1 >= autoThreshold, best.1 - second >= minMargin {
+        if allowAuto, best.1 >= autoThreshold, best.1 - second >= minMargin {
             return SpeakerMatchResult(tier: .auto, personID: best.0.personID, score: best.1, secondScore: second, topCandidateID: best.0.personID)
         }
         if best.1 >= suggestThreshold {
