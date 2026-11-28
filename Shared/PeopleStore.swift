@@ -220,6 +220,9 @@ extension BeanStore {
         if excluded {
             recordings[i].people = PeopleProjection.removingVoice(recordings[i].people, voicePeople: recordings[i].voicePeople)
             recordings[i].voicePeople = []
+        } else {
+            // 取消排除：发言归属还在库里（排除只挡投影、不删 utterances），立即按它把人物名投回录音列表与详情
+            syncPeopleToLibrary([recordingID])
         }
         saveLibrary()
         peopleRevision += 1

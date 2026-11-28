@@ -44,6 +44,16 @@ final class PeoplePipelineTests: XCTestCase {
         XCTAssertEqual(PeopleProjection.removingVoice(["李四"], voicePeople: []), ["李四"])
     }
 
+    /// 取消排除（`setPeopleExcluded(false)` 的投影数据流）：排除只拿掉声纹名、不删发言归属，
+    /// 重新投影时应把声纹名投回 `people`/`voicePeople`，模型提到的名字也不丢。
+    func testUnexcludeRestoresVoicePeople() {
+        let afterExclude = PeopleProjection.removingVoice(["张三", "李四"], voicePeople: ["张三"])
+        XCTAssertEqual(afterExclude, ["李四"])
+        let restored = PeopleProjection.merge(llmPeople: afterExclude, oldVoicePeople: [], newVoicePeople: ["张三"])
+        XCTAssertEqual(restored.people, ["张三", "李四"])
+        XCTAssertEqual(restored.voicePeople, ["张三"])
+    }
+
     // MARK: 按时间对齐
 
     /// 句子归给中点所在区间的说话人；中点落在空隙里就不归。
