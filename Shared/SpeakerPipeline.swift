@@ -79,14 +79,16 @@ extension BeanStore {
         for (n, run) in runs.enumerated() {
             try Task.checkCancellation()
             progress(Double(n) / Double(max(1, runs.count)))
-            guard run.end > run.start else { continue }
-            let piece = Array(samples[run.start..<run.end])
+            // 分人模型的段尾可能略超出音频时长（浮点/帧估算），夹到采样数以内，避免数组越界
+            let end = min(run.end, samples.count)
+            guard end > run.start else { continue }
+            let piece = Array(samples[run.start..<end])
             guard Self.hasSpeech(piece) else { continue }
-            if run.end - run.start <= 15 * rate {
+            if end - run.start <= 15 * rate {
                 let text = try await QwenASR.shared.transcribe(samples: piece, serverPath: server)
                 if !text.isEmpty, !Self.isFiller(text) {
                     segments.append(Segment(start: Double(run.start) / Double(rate), text: text,
-                                            speaker: run.speaker, end: Double(run.end) / Double(rate)))
+                                            speaker: run.speaker, end: Double(end) / Double(rate)))
                 }
             } else {
                 // 单人连续发言超过 15 秒：沿停顿切细，仍归属同一说话人

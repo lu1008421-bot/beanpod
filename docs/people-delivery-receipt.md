@@ -27,6 +27,10 @@
 | `d7bcf03` | 返工三补充 | 试听状态首尾 0.25s 容差、只在真正播放这条这段时显示「停」、暂停即清试听状态；空库「我的声音」贴底；返回条快捷键改 ⌘⌥[；补容差单测 |
 | `977c356` | 最终验收收口 | 修复人工 UI 实测 4 处问题：待认识→文字稿→返回选错人、单句改归属后旧卡仍播同句、排除录音后待认识卡仍显示、QA 启动命令加 `-demo`；新增 2 项 `carveManualRange` 单测 |
 | `56a1a3d` | 合并前收口 | 修复取消排除录音后不恢复人物名：`setPeopleExcluded(false)` 重新投影发言归属；补 `testUnexcludeRestoresVoicePeople` 单测 |
+| `38ed582` | 合并前收口 | 回执更新：记录 `56a1a3d` 收口结果与第 4 节合并判断 |
+| `3932ff3` | 合并前收口 | 默认「建议确认」模式：`SpeakerMatcher.autoAssignEnabled=false` + `match(allowAuto:)`，高分也降级 `.suggest` 不自动落库署名；补 `testDefaultDisablesAutoAssign` |
+| `0eb5566` | 合并 main | `git merge main`（`2dd2db4`，非 rebase），解决 BeanStore/Domain/Pipeline 三处冲突，保留 PR#1/3/4/5 |
+| （本次提交） | 合并前收口 | 修复 `transcribeWithSpeakers` 段尾越界崩溃（`min(run.end, samples.count)`）；更新回执 |
 
 ## 2. 构建与测试（本机实测，交付前最后一轮原始结果）
 
@@ -53,6 +57,8 @@ PeoplePipeline 的 19 项单测覆盖：名单合并不丢模型提及人名、�
 最终验收收口（`977c356`）后重跑，`swift test` 22/22、PeopleDBTests 39/39（0 failures；新增 2 项 `carveManualRange`：单句改归属后旧卡只剩另一句且代表原声删空、部分重叠一分为二）、BeanPod Mac 与 BeanPodMobile iOS 模拟器均 BUILD SUCCEEDED。
 
 合并前收口（`56a1a3d`）后重跑，`swift test` 22/22、PeopleDBTests 40/40（0 failures；新增 `testUnexcludeRestoresVoicePeople`）、BeanPod Mac / BeanPodMobile iOS 模拟器 / speaker-lab 均 BUILD SUCCEEDED。
+
+合入 main（`0eb5566`）并修复段尾越界后重跑：`swift test` 40/40（新增 main 带来的 BeanKitTests 18 项）、PeopleDBTests 41/41（0 failures；新增 `testDefaultDisablesAutoAssign`）、BeanPod Mac / BeanPodMobile iOS 模拟器 / speaker-lab 均 BUILD SUCCEEDED。
 
 ## 3. 功能开关与关闭方式
 
@@ -197,3 +203,37 @@ PeoplePipeline 的 19 项单测覆盖：名单合并不丢模型提及人名、�
 - 代码与质量全绿：`swift test` 22/22、PeopleDBTests 40/40、BeanPod Mac / BeanPodMobile iOS 模拟器 / speaker-lab 均 BUILD SUCCEEDED；UI 回归 8/8 实测通过。
 - 但第 4 节「自动署名」放行门槛未达：精准率/召回/误认三项因缺真实样本无法验证。按计划「若识别指标未过自动署名门槛，仍可先交付手动认人 + 推荐候选（关闭自动落库署名）」，**合并后应维持「建议确认」模式（不自动落库署名）**，待真实样本校准后再评估开启自动署名。
 - 本轮边界：不 push 远端；未触碰正式录音库与正式版 App；已清理 /tmp 过程文件与 QA 进程。
+
+## 11. 合并 main 前最后一轮收口（`3932ff3` + `0eb5566` + 本次提交）
+
+### 11.1 默认「建议确认」模式（关闭自动落库署名）
+
+- `Shared/SpeakerMatching.swift`：`SpeakerMatcher` 新增 `static let autoAssignEnabled = false`（注释注明「第 4 节真实多天样本阈值校准通过前保持关闭」）；`match(...)` 新增带默认值参数 `allowAuto: Bool = autoAssignEnabled`，auto 判定改为 `if allowAuto, best.1 >= autoThreshold, ...`。
+- 关闭时（默认），即使分数 ≥ `autoThreshold`(0.60) 且满足 margin，也降级返回 `.suggest`：保留 `topCandidateID` 与 `score`，`personID = nil`，绝不自动落库署名；用户点「就是 TA」后才归属并入库确认样本。
+- `Tests/PeopleDBTests/SpeakerMatcherTests.swift`：原三档用例显式传 `allowAuto: true` 保持覆盖；新增 `testDefaultDisablesAutoAssign`（高分 1.0 默认落 `.suggest`、`personID=nil`、`topCandidateID` 命中）。
+
+### 11.2 合入 main `2dd2db4`（merge，非 rebase）
+
+`git merge main` 带入 PR#1 飞书重试、PR#3 HTTP/MCP 安全（`MCPHTTPPolicy`/`MCPHTTPDecision`）、PR#4 流式音频导入（`AudioStream`）、PR#5 LLM 润色/分层模型路由/Token 账本。三处冲突解决：
+
+- `Shared/BeanStore.swift` `init()`：保留 feat 的 `loadPeople()+syncPeopleToLibrary()` 并加上 main 的 `loadUsageLedger()`。
+- `Shared/Domain.swift` `CodingKeys`：合并为同时含 feat 的 `voicePeople/peopleExcluded` 与 main 的 `llmTokens`（三字段均在，decode 已确认）。
+- `Shared/Pipeline.swift` `runBody()`：main 把 `if/else if` 重构为 `switch decision`（`ASRRoutePolicy.resolve` 产出 `ASRPreferredEngine`）；feat 的「路径 A」`transcribeWithSpeakers` 移入 `case .qwen:` 内并用 `#if os(macOS)` 包裹（`eligibleForAutoSpeaker && speakerPipelineReady` 走声纹分人，否则 `QwenASR`；非 macOS 直接 `QwenASR`）。
+
+自动合并文件复查（App/SettingsView.swift、App/Views.swift、Shared/Analyzer.swift、Shared/AudioTools.swift、Sources/beanpod/main.swift、project.yml）均同时含双方改动，PR#1/3/4/5 功能未丢。
+
+### 11.3 合并后全量回归与隔离库冒烟
+
+回归全绿（修复段尾越界后重跑）：`xcodegen generate`、`swift test` 40/40、PeopleDBTests 41/41、BeanPod Mac / BeanPodMobile iOS 模拟器 / speaker-lab 均 BUILD SUCCEEDED。
+
+隔离库（`--args -demo -data-dir /tmp/beanpod-merge-smoke`，QA 构建）最小冒烟：
+
+- 导入 `smoke-a`（公开四人样本拼接双说话人，加 0.5s 静音间隔，79.86s）→ 路径 A 转写 + 声纹分人成功（`Qwen3‑ASR 0.6B · 声纹分人`），建 2 张待认识卡。
+- 直接改库确认其中一张为「测试甲」（`status=confirmed`、样本 `confirmed=1`）后重启，导入 `smoke-b`（同人声音，59.16s）。
+- 结果：测试甲的声音在 smoke-b 里**未自动署名**（测试甲在该录音 0 条 auto 归属），而是落 `speaker_suggestion`（candidateID=测试甲、score 0.9399）等「就是 TA」确认；另一说话人同样落 suggestion（candidateID=未记名 A、score 0.9998）。即使 0.9998 也降级 `.suggest` 而非 `.auto`，验证默认关闭自动署名生效。
+
+冒烟过程中发现并修复一处崩溃：`transcribeWithSpeakers` 中分人模型的段尾略超出音频时长（浮点/帧估算），`samples[run.start..<run.end]` 数组越界（SIGTRAP）。修复为 `let end = min(run.end, samples.count)` 并替换切片与 `Segment.end`（本提交）。修复后重建并重跑冒烟通过。
+
+### 11.4 边界与清理
+
+全程不 push 远端、未触碰正式录音库（51 条）与正式版 App（PID 41681 保持运行）；冒烟后退出 QA 进程并清理 `/tmp/beanpod-merge-smoke`、`/tmp/beanpod-smoke-src` 与崩溃报告；保留公开样本与运行中的 `beanpod-lark.log`。
