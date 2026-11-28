@@ -4,7 +4,7 @@ import SwiftUI
 // MARK: - 导航
 
 enum Route: Hashable {
-    case dashboard, all, starred, scene(Scene), knowledge, device
+    case dashboard, all, starred, scene(Scene), knowledge, people, device
     /// 从链接导入的素材。
     case materials
     /// 一个项目里的录音和素材。
@@ -46,9 +46,37 @@ final class Navigator {
     var pendingMove: Set<UInt32> = []
     var renamingProject: UUID?
     var deletingProject: UUID?
-
+    
+    /// 人物页当前选中的那位。
+    var selectedPersonID: UUID?
+    /// 要跳到哪条录音文字稿的哪一句（从人物页过来时带的时间点，到了就清掉）。
+    struct TranscriptTarget: Equatable {
+        var recording: UInt32
+        var start: TimeInterval?
+    }
+    var pendingTranscriptTarget: TranscriptTarget?
+    /// 从人物页跳到文字稿后，「返回」要回到的人和页面。
+    var returnRoute: Route?
+    var returnPersonID: UUID?
+    
     func open(_ id: UInt32) { route = .all; selection = id }
-}
+    
+    /// 从人物页跳到某条录音的文字稿（切到文字稿页签、滚到并高亮目标句）。
+    func openTranscript(recording id: UInt32, start: TimeInterval?, fromPerson personID: UUID?) {
+        returnRoute = route
+        returnPersonID = personID
+        pendingTranscriptTarget = TranscriptTarget(recording: id, start: start)
+        route = .all
+        selection = id
+    }
+    
+    /// 从文字稿回到刚才那位人物。
+    func backToPerson() {
+        route = returnRoute ?? .people
+        returnRoute = nil
+        returnPersonID = nil
+    }
+    }
 
 struct RootView: View {
     @Environment(BeanStore.self) private var store
@@ -65,6 +93,7 @@ struct RootView: View {
             switch nav.route {
             case .dashboard: DashboardView().background(Backdrop())
             case .knowledge: KnowledgeView().background(Backdrop())
+            case .people: PeopleView().background(Backdrop())
             case .device: DeviceView().background(Backdrop())
             case .trash: TrashView().background(Backdrop())
             case .dictation: DictationView().background(Backdrop())
@@ -322,6 +351,7 @@ struct Sidebar: View {
         case .dashboard: 0
         case .all, .starred, .scene: 1
         case .knowledge: 2
+        case .people: 5
         case .materials: 3
         case .dictation: 4
         case .device, .project, .tag, .trash: -1
@@ -359,6 +389,7 @@ struct Sidebar: View {
                     item(String(localized: "语音输入"), "keyboard", 4, count: store.dictations.count) { nav.route = .dictation }
                 }
                 item(String(localized: "知识库"), "book.closed.fill", 2) { nav.route = .knowledge }
+                item(String(localized: "人物"), "person.2.fill", 5, count: store.pendingPeopleCount) { nav.route = .people }
             }
             projectList.padding(.top, 20)
             SidebarTags().padding(.top, 16)
@@ -1393,9 +1424,12 @@ struct RecordingDetail: View {
     let recording: Recording
     @State private var title = ""
     @State private var tab = 0
-
+    /// 从人物页跳过来时要高亮的句子。
+    @State private var targetStart: TimeInterval?
+    
     var body: some View {
         VStack(spacing: 0) {
+            returnBar
             header
             Divider().overlay(Theme.warm200.opacity(0.6))
             ScrollView {
@@ -1410,12 +1444,12 @@ struct RecordingDetail: View {
                         if recording.transcript != nil {
                             switch tab {
                             case 0: NotesView(recording: recording)
-                            case 1: TranscriptView(recording: recording)
+                            case 1: TranscriptView(recording: recording, targetStart: targetStart)
                             default: RewriteView(recording: recording)
                             }
-                        } else if store.stages[recording.id] == nil {
+                            } else if store.stages[recording.id] == nil {
                             notProcessed
-                        }
+                            }
                     } else {
                         notDownloaded
                     }
@@ -1453,7 +1487,11 @@ struct RecordingDetail: View {
                 .overlay(alignment: .top) { Divider().overlay(Theme.warm200.opacity(0.6)) }
             }
         }
-        .onAppear { title = recording.title ?? "" }
+        .onAppear {
+            title = recording.title ?? ""
+            consumeTranscriptTarget()
+        }
+        .onChange(of: nav.pendingTranscriptTarget, initial: true) { _, _ in consumeTranscriptTarget() }
         .confirmationDialog("从录音豆里删除这条录音？", isPresented: Bindable(nav).confirmDeviceDelete) {
             Button("删除", role: .destructive) { store.deleteFromDevice(recording.id) }
         } message: {
@@ -1461,12 +1499,37 @@ struct RecordingDetail: View {
         }
     }
 
+    /// 从人物页跳过来时，顶上留一条「返回某人」。
+    @ViewBuilder private var returnBar: some View {
+        if nav.returnPersonID != nil, nav.returnRoute == .people {
+            let name = nav.returnPersonID.flatMap { pid in store.people.first(where: { $0.id == pid }) }
+                .map { $0.displayName.isEmpty ? String(localized: "未记名 \($0.strangerLabel)") : $0.displayName } ?? String(localized: "人物")
+            Button { nav.backToPerson() } label: {
+                Label("返回 \(name)", systemImage: "arrow.left")
+                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.warm700)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Theme.warm100, in: .rect(cornerRadius: Theme.Radius.card))
+            }
+            .buttonStyle(.plain).keyboardShortcut("[", modifiers: [.command, .option]).help("返回人物（⌘⌥[）")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24).padding(.top, 12)
+        }
+    }
+    
+    /// 人物页带着时间点跳过来：切到文字稿、把目标句交给 TranscriptView 高亮。
+    private func consumeTranscriptTarget() {
+        guard let t = nav.pendingTranscriptTarget, t.recording == recording.id else { return }
+        nav.pendingTranscriptTarget = nil
+        tab = 1
+        targetStart = t.start
+    }
+
     /// 顶上一块：场景、时间、一排工具；下面是标题和三个页签。
     private var header: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 8) {
-                Menu {
-                    ForEach(Scene.allCases) { s in
+    VStack(alignment: .leading, spacing: 16) {
+    HStack(spacing: 8) {
+    Menu {
+    ForEach(Scene.allCases) { s in
                         Button { store.setScene(recording.id, s) } label: { Label(s.name, systemImage: s.icon) }
                     }
                 } label: {
@@ -1533,6 +1596,14 @@ struct RecordingDetail: View {
                     }
                     .disabled(recording.segments.isEmpty || !store.lightAnalysisAvailable || store.polishing.contains(recording.id) || store.stages[recording.id] != nil)
                     Button("重新转写") { store.process(recording.id, retranscribe: true) }.disabled(recording.textOnly)
+                    if store.peopleDB != nil, !recording.textOnly {
+                    Divider()
+                    // 这条录音不参与「人物」：不再分人，也不进任何人的时间线与资料
+                    Toggle(isOn: Binding(get: { recording.peopleExcluded },
+                    set: { store.setPeopleExcluded(recordingID: recording.id, $0) })) {
+                    Label("排除出「人物」", systemImage: "person.slash")
+                    }
+                    }
                     Button(store.settings.asrConfig == nil ? "交给云端重转（先在设置里配好云端转写）" : "交给云端重转") {
                         store.process(recording.id, retranscribe: true, cloud: true)
                     }
@@ -2088,9 +2159,11 @@ struct NotesView: View {
 }
 
 struct TranscriptView: View {
-    @Environment(BeanStore.self) private var store
-    let recording: Recording
-    @State private var showClean = true
+@Environment(BeanStore.self) private var store
+let recording: Recording
+/// 从人物页跳过来时要滚到并高亮的句子开头。
+var targetStart: TimeInterval? = nil
+@State private var showClean = true
     @State private var editing = false
     @State private var replacing = false
     @State private var wrong = ""
@@ -2106,7 +2179,9 @@ struct TranscriptView: View {
     @AppStorage("sentenceLoop") private var loopOn = false
     @AppStorage("followPlayback") private var follow = true
     @State private var hovered: TimeInterval?
-
+    /// 正在高亮的句子（从人物页跳过来时短暂点亮）。
+    @State private var highlight: TimeInterval?
+    
     enum Shown: String, CaseIterable {
         case original = "原文", both = "双语", translated = "译文"
         /// 显示用的名字（rawValue 只当标识用）。
@@ -2160,10 +2235,13 @@ struct TranscriptView: View {
                 if let t = translated(0) { translationLine(t, solo: view == .translated) }
             }
             if canListen { listenBar }
+            if isWholeTranscript { wholeTranscriptNotice }
             ScrollViewReader { proxy in
-                VStack(alignment: .leading, spacing: 14) {
-                    ForEach(Array(recording.segments.enumerated()), id: \.element.id) { i, seg in row(seg, index: i).id(seg.start) }
-                }
+            VStack(alignment: .leading, spacing: 14) {
+            ForEach(Array(recording.segments.enumerated()), id: \.element.id) { i, seg in row(seg, index: i).id(seg.start) }
+            }
+            .onAppear { jump(to: targetStart, proxy: proxy) }
+            .onChange(of: targetStart) { _, t in jump(to: t, proxy: proxy) }
                 // 跟着播放滚：当前句换了就把它滚到中间
                 .onChange(of: currentIndex) { _, i in
                     guard follow, !editing, let i, store.isPlaying else { return }
@@ -2180,7 +2258,51 @@ struct TranscriptView: View {
     }
 
     // MARK: 逐句回听
-
+    
+    /// 滚到目标句并高亮两秒半，让人看清是从人物页哪一句跳过来的。
+    private func jump(to start: TimeInterval?, proxy: ScrollViewProxy) {
+        guard let start, !recording.segments.isEmpty,
+              let idx = recording.segments.firstIndex(where: { $0.start >= start - 0.3 }) else { return }
+        let key = recording.segments[idx].start
+        withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(key, anchor: .center) }
+        highlight = key
+        Task {
+            try? await Task.sleep(for: .seconds(2.5))
+            if highlight == key { highlight = nil }
+        }
+    }
+    
+    /// 整篇只有一句、又从 0 秒开始：说明没有逐句时间戳。
+    private var isWholeTranscript: Bool {
+        recording.segments.count == 1 && recording.segments[0].start == 0 && !recording.textOnly && recording.duration > 8
+    }
+    
+    /// 没有逐句时间戳就不逐句归人；把按声音切出来的说话人列出来，让人点开听。
+    private var wholeTranscriptNotice: some View {
+        let spans = Array(store.acousticTimeline(recordingID: recording.id).sorted { $0.end - $0.start > $1.end - $1.start }.prefix(8))
+            .sorted { $0.start < $1.start }
+        return VStack(alignment: .leading, spacing: 8) {
+            Label("无逐句时间戳，无法逐句归人。下面是按声音切出来的说话人，点开听是谁在说。", systemImage: "person.wave.2")
+                .font(.callout).foregroundStyle(Theme.warm700)
+            if spans.isEmpty {
+                Text("这条没有可用的本地音频，分不出说话人。").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(spans.enumerated()), id: \.offset) { _, sp in
+                    Button { store.playSpan(recording.id, sp.start...max(sp.start + 0.3, sp.end), loop: false) } label: {
+                        Label("说话人 \(sp.speaker + 1) · \(clock(sp.start)) – \(clock(sp.end))", systemImage: "play.circle")
+                            .font(.callout).foregroundStyle(Theme.warm700)
+                            .padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(Theme.warm100, in: .rect(cornerRadius: Theme.Radius.card))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.warm100.opacity(0.6), in: .rect(cornerRadius: Theme.Radius.card))
+    }
+    
     /// 有音频、有分句时间的才能逐句听
     private var canListen: Bool { !recording.textOnly && !recording.segments.isEmpty }
     private var mine: Bool { store.playingID == recording.id }
@@ -2416,7 +2538,7 @@ struct TranscriptView: View {
         }
         .padding(.vertical, marked || playingThis || hovered == seg.start ? 6 : 0)
         .padding(.horizontal, marked || playingThis || hovered == seg.start ? 8 : 0)
-        .background(playingThis ? Theme.accent.opacity(0.09) : marked ? Theme.accent.opacity(0.12) : hovered == seg.start && canListen && !editing ? Theme.warm100 : .clear,
+        .background(highlight == seg.start ? Theme.accent.opacity(0.24) : playingThis ? Theme.accent.opacity(0.09) : marked ? Theme.accent.opacity(0.12) : hovered == seg.start && canListen && !editing ? Theme.warm100 : .clear,
                     in: .rect(cornerRadius: 8))
         .overlay(alignment: .leading) {
             if playingThis { Rectangle().fill(Theme.accent).frame(width: 3).padding(.vertical, 4) }
@@ -2459,6 +2581,30 @@ struct TranscriptView: View {
                 Button(name) { store.setSpeaker(recording.id, start: seg.start, to: n) }
             }
             Button("新增说话人") { store.addSpeaker(recording.id, start: seg.start) }
+            // 改归人物库里的人物（含「我」）：人工指定优先于重跑模型；空人物库也能直接标我/升格路人
+            Divider()
+            Text("改归人物").font(.caption).foregroundStyle(.secondary)
+            if let me = store.people.first(where: \.isMe) {
+                Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: me.id) } label: {
+                    Label("我", systemImage: "person.fill")
+                }
+            } else {
+                Button {
+                    if let meID = store.createPerson(name: "我", status: .confirmed, isMe: true) {
+                        store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: meID)
+                    }
+                } label: { Label("标为我", systemImage: "person.fill") }
+            }
+            ForEach(store.confirmedPeople) { p in
+                Button { store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: p.id) } label: {
+                    Label(p.displayName, systemImage: "person.crop.circle")
+                }
+            }
+            Button {
+                if let pid = store.createPerson(name: "", status: .pending) {
+                    store.reassignSegment(recordingID: recording.id, start: seg.start, localSpeaker: seg.speaker, to: pid)
+                }
+            } label: { Label("升格为待认识人物", systemImage: "person.crop.circle.badge.questionmark") }
             if let n = seg.speaker, recording.speakers.indices.contains(n) {
                 Divider()
                 Button("改名…") { newName = recording.speakers[n]; renaming = n }

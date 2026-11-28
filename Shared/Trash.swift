@@ -122,8 +122,10 @@ extension BeanStore {
     func deleteForever(_ entryIDs: [UUID]) {
         for entryID in entryIDs {
             guard let k = trash.firstIndex(where: { $0.id == entryID }) else { continue }
+            let recID = trash[k].recording.id
             try? FileManager.default.removeItem(at: trashFolder.appendingPathComponent(trash[k].folder, isDirectory: true))
-            addLog("彻底删除：\(trash[k].recording.id)")
+            purgePeopleForRecording(recID)   // 人物库里的发言归属、资料、声音样本跟着级联清理
+            addLog("彻底删除：\(recID)")
             trash.remove(at: k)
         }
         saveTrash()

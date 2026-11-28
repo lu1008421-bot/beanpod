@@ -116,6 +116,16 @@ final class BeanStore {
     /// 最近删除（Trash.swift）：本机删掉的录音放 7 天，可以恢复。
     var trash: [TrashedRecording] = []
 
+    // 人物（PeopleDB.swift / PeopleStore.swift）：跨录音人物身份的唯一权威源
+    /// 打开失败时为 nil，界面降级为手工人物维护，不阻断原有转写/播放。
+    @ObservationIgnored var peopleDB: PeopleDB?
+    var people: [Person] = []
+    var peopleError: String?
+    #if os(macOS)
+    /// 声纹分人后尚未建卡、等场景确定再决定是否升格的新声音（按录音 id 缓存）。
+    @ObservationIgnored var pendingStrangerCandidates: [UInt32: [StrangerCandidate]] = [:]
+    #endif
+
     // 录音
     var recordings: [Recording] = []
     /// 自己录的（不含从链接导入的素材）。录音页、总览只看这些；素材只在素材库里
@@ -133,9 +143,16 @@ final class BeanStore {
     @ObservationIgnored var stageSince: [UInt32: Date] = [:]
     /// 这一批从什么时候开始处理的；都处理完了为空
     var batchSince: Date?
-    /// 模型下载（ModelDownloader.swift）：转写模型、本机整理模型各一个。
+    /// 模型下载（ModelDownloader.swift）：转写模型、本机整理模型、声纹模型各一个。
     var asrJob: DownloadJob?
     var llmJob: DownloadJob?
+    #if os(macOS)
+    var speakerJob: DownloadJob?
+    /// 声纹模型是否就绪（分割 + 声纹向量都在）。存起来而不是每次查磁盘，界面才跟得上下载完成。
+    var speakerModelsReady = false
+    #endif
+    /// 人物库有增删改时加一，界面据此刷新样本数、时间线和资料。
+    var peopleRevision = 0
     var modelDownload: Double? { asrJob?.fraction }
     var llmDownload: Double? { llmJob?.fraction }
     /// 正在保存或下载画面的素材（VideoKeep.swift）。
@@ -160,6 +177,8 @@ final class BeanStore {
 
     // 播放
     var playingID: UInt32?
+    /// 正在播的受管声音样本文件名（和录音播放互斥）。
+    var playingSampleFile: String?
     var isPlaying = false
     var playhead: TimeInterval = 0
 
@@ -280,17 +299,47 @@ final class BeanStore {
     /// 给 README 截图用，不碰真实录音（示例库由 scripts/make-demo-library.py 生成）。
     nonisolated static let demo = CommandLine.arguments.contains("-demo")
 
+    /// 隔离数据根目录：启动参数 `-data-dir <绝对路径>`（优先）或环境变量 `BEANPOD_DATA_DIR`。
+    /// 测试与自动化验收完全写入该目录（Recordings/、People/ 等都在其下），不碰正式库。优先级高于 `-demo`。
+    /// QA 启动请用 `--args -demo -data-dir <独立测试目录>`：`-demo` 关蓝牙/MCP/飞书，`-data-dir` 指到临时库，二者缺一不可
+    /// （只传 `-data-dir` 会照常连录音豆、列出设备录音；只传 `-demo` 会读固定的示例库）。
+    nonisolated static let dataDir: URL? = {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "-data-dir"), i + 1 < args.count, !args[i + 1].isEmpty {
+            return URL(fileURLWithPath: args[i + 1], isDirectory: true)
+        }
+        if let env = ProcessInfo.processInfo.environment["BEANPOD_DATA_DIR"], !env.isEmpty {
+            return URL(fileURLWithPath: env, isDirectory: true)
+        }
+        return nil
+    }()
+
     let folder: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent(BeanStore.demo ? "BeanPod/Demo/Recordings" : "BeanPod/Recordings", isDirectory: true)
+        let dir: URL
+        if let dataDir = BeanStore.dataDir {
+            dir = dataDir.appendingPathComponent("Recordings", isDirectory: true)
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            dir = base.appendingPathComponent(BeanStore.demo ? "BeanPod/Demo/Recordings" : "BeanPod/Recordings", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
+
+    /// 数据根目录：Recordings 与其平行的 People 等目录都放这里。
+    var dataRoot: URL {
+        if let dataDir = BeanStore.dataDir { return dataDir }
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent(BeanStore.demo ? "BeanPod/Demo" : "BeanPod", isDirectory: true)
+    }
 
     init() {
         loadLibrary()
         loadTrash()
         loadProjects()
+        loadPeople()
+        // 人物卡上次关闭前可能改过名/合并过：启动时把录音里的说话人标签和人物名单对齐一次
+        syncPeopleToLibrary()
         loadUsageLedger()
         refreshASRAvailability()
         watchInbox()
@@ -1119,7 +1168,9 @@ final class BeanStore {
 
     func togglePlay(_ id: UInt32) {
         if playingID == id, let player {
-            if player.isPlaying { player.pause(); isPlaying = false } else { player.play(); isPlaying = true; tick() }
+            if player.isPlaying {
+                player.pause(); isPlaying = false; spanPlayback.clear()   // 暂停后界面别再显示「停」
+            } else { player.play(); isPlaying = true; tick() }
             return
         }
         stop()
@@ -1137,19 +1188,19 @@ final class BeanStore {
     /// 单句循环的那一句：播到句尾跳回句首。loopCount 是第几遍（从 1 起）。
     var loopSpan: ClosedRange<TimeInterval>?
     var loopCount = 0
-    /// 「这句再听」：播到这里自己停。
-    @ObservationIgnored var stopAt: TimeInterval?
+    /// 就地听一段的记账：正在听哪一段（`activeSpan`，人物页据此切换「听 / 停」）、听到哪里停。
+    var spanPlayback = SpanPlayback()
+    var activeSpan: ClosedRange<TimeInterval>? { spanPlayback.activeSpan }
 
-    /// 播一句：loop 为真就一直循环这句，否则播完这句自己停（「这句再听」）。
+    /// 播一句：loop 为真就一直循环这句，否则播完这句自己停（「这句再听」）。两种都记进 `activeSpan`。
     func playSpan(_ id: UInt32, _ span: ClosedRange<TimeInterval>, loop: Bool) {
         // 先切到这条、跳到句首（切换录音会 stop()，把循环和停点清掉），再设循环 / 停点
         play(id, at: span.lowerBound)
-        // 最后一句的句尾就是音频结尾：留一点余量，不然 100ms 一次的检查容易错过、播放器先自己停了
         let duration = recordings.first { $0.id == id }?.duration ?? span.upperBound
-        let end = max(span.lowerBound + 0.3, min(span.upperBound, duration - 0.15))
+        spanPlayback.begin(span, loop: loop, duration: duration)
+        let end = spanPlayback.activeSpan?.upperBound ?? span.lowerBound
         loopSpan = loop ? span.lowerBound...end : nil
         loopCount = loop ? 1 : 0
-        stopAt = loop ? nil : end
     }
 
     func endLoop() { loopSpan = nil; loopCount = 0 }
@@ -1227,17 +1278,36 @@ final class BeanStore {
     func play(_ id: UInt32, at time: TimeInterval) {
         // 跳到循环那句外面去了：不再循环 / 不再到句尾停
         if let s = loopSpan, !s.contains(time) { endLoop() }
-        stopAt = nil          // 「这句再听」的停点只对那一次有效；playSpan 会在跳过去之后重新设
+        // 跳出了正在听的那一段：这段算听完，停点作废；还在这段里面就照旧到句尾停
+        spanPlayback.leaveIfOutside(at: time)
         if playingID != id { togglePlay(id) }
         seek(time)
         if !isPlaying { player?.play(); isPlaying = true; tick() }
     }
 
     func stop() {
-        loopSpan = nil; loopCount = 0; stopAt = nil
+        loopSpan = nil; loopCount = 0; spanPlayback.clear()
         ticker?.cancel(); player?.stop(); player = nil
-        playingID = nil; isPlaying = false; playhead = 0
+        playingID = nil; playingSampleFile = nil; isPlaying = false; playhead = 0
     }
+
+    #if os(macOS)
+    /// 播放受管声音样本（与主录音播放器互斥）。样本是 `People/Samples/` 下独立的 wav 文件。
+    func playSampleFile(_ name: String) {
+        // 同一段再点一次：暂停 / 接着放
+        if playingSampleFile == name, let player {
+            if player.isPlaying { player.pause(); isPlaying = false } else { player.play(); isPlaying = true; tick() }
+            return
+        }
+        let url = dataRoot.appendingPathComponent("People/Samples").appendingPathComponent(name)
+        stop()
+        guard let p = try? AVAudioPlayer(contentsOf: url) else { return }
+        p.enableRate = true; p.rate = playRate
+        player = p; playingID = nil; playingSampleFile = name; playhead = 0
+        p.play(); isPlaying = true
+        tick()
+    }
+    #endif
 
     private func tick() {
         ticker?.cancel()
@@ -1248,11 +1318,13 @@ final class BeanStore {
                 if let span = self.loopSpan, self.playhead >= span.upperBound - 0.05 {
                     player.currentTime = span.lowerBound; self.playhead = span.lowerBound; self.loopCount += 1
                 }
-                // 这句再听：播完这句停在句尾
-                if let end = self.stopAt, self.playhead >= end {
-                    player.pause(); self.isPlaying = false; self.stopAt = nil
+                // 这句再听 / 听一段：播到这段句尾自己停，「听 / 停」按钮切回「听」
+                if let end = self.spanPlayback.stopAt, self.playhead >= end {
+                    player.pause(); self.isPlaying = false; self.spanPlayback.clear()
                     return
                 }
+                // 拖进度条拖出了正在听的那一段
+                self.spanPlayback.leaveIfOutside(at: self.playhead)
                 if !player.isPlaying {
                     // 循环的是最后一句、播放器已经播到结尾自己停了：回句首接着循环
                     if self.isPlaying, let span = self.loopSpan {
@@ -1261,7 +1333,7 @@ final class BeanStore {
                         try? await Task.sleep(for: .milliseconds(100))
                         continue
                     }
-                    if self.isPlaying { self.isPlaying = false; self.playhead = 0 }  // 自然播完
+                    if self.isPlaying { self.isPlaying = false; self.playhead = 0; self.spanPlayback.clear() }  // 自然播完
                     return
                 }
                 try? await Task.sleep(for: .milliseconds(100))

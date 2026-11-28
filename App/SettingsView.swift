@@ -462,6 +462,17 @@ private struct ModelsPane: View {
                 }
             }
 
+            ModelCard(icon: "waveform.badge.plus", title: String(localized: "说话人识别（声纹）"),
+                      ok: store.speakerModelsReady,
+                      status: store.speakerModelsReady ? String(localized: "已就绪") : String(localized: "还差一步")) {
+                downloadView(store.speakerJob, ready: store.speakerModelsReady,
+                             readyText: String(localized: "已下载 · 约 34 MB"), size: String(localized: "约 34 MB")) { store.downloadSpeakerModels() }
+                Text(store.speakerModelsReady
+                     ? "分人、认声纹都在这台 Mac 上跑，声音不会上传。"
+                     : "下载后，「人物」才能自动认出老朋友、按人整理谁说过什么。")
+                    .font(.callout).foregroundStyle(store.speakerModelsReady ? Color.secondary : Theme.amber)
+            }
+
             ModelCard(icon: "doc.text", title: String(localized: "整理：写纪要、回答提问"), ok: store.analysisAvailable, status: store.analysisAvailable ? String(localized: "已就绪") : String(localized: "还没选模型")) {
                 VStack(alignment: .leading, spacing: 8) {
                     Picker("用哪边的模型", selection: $settings.analysisMode) {

@@ -214,10 +214,11 @@ nonisolated enum Analyzer {
     // MARK: 没有模型时的粗整理
 
     /// 只靠关键词猜场景、截取开头当摘要。结果很粗，界面上会标明。
-    static func fallback(transcript: String, duration: TimeInterval, fixedScene: Scene?) -> Analysis {
+    /// - Parameter localSpeakers: 分人听出的说话人数。两个以上的人在说话就不是自言自语，不按短录音兜底成「灵感」。
+    static func fallback(transcript: String, duration: TimeInterval, fixedScene: Scene?, localSpeakers: Int = 0) -> Analysis {
         let scored = Scene.allCases.map { s in (s, s.keywords.reduce(0) { $0 + transcript.components(separatedBy: $1).count - 1 }) }
         var scene = scored.max { $0.1 < $1.1 }.flatMap { $0.1 > 0 ? $0.0 : nil } ?? .other
-        if scene == .other, duration < 90 { scene = .memo }
+        if scene == .other, FallbackSceneRule.looksLikeMemo(duration: duration, localSpeakers: localSpeakers) { scene = .memo }
         let sentences = transcript.split(whereSeparator: { "。！？!?\n".contains($0) }).map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.count > 3 }
         return Analysis(scene: fixedScene ?? scene,
                         title: String((sentences.first ?? "").prefix(16)),

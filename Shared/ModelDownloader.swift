@@ -9,6 +9,9 @@ nonisolated struct ModelFile: Sendable {
     var revision: String
     var size: Int64
     var sha256: String
+    /// 兜底直链。HuggingFace/镜像/魔搭都下不来（比如魔搭上没有 `csukuangfj/*`）时按顺序回退，
+    /// 仍沿用同一条 `DownloadJob` 的断点续传、超时切源与 SHA‑256 校验。
+    var fallbackURLs: [URL] = []
 }
 
 /// 下载源。HuggingFace 在国内常常很慢或连不上，所以带两个国内镜像；三处的文件一样，靠 SHA‑256 保证。
@@ -92,23 +95,25 @@ final class DownloadJob {
             if !fm.fileExists(atPath: part.path) { fm.createFile(atPath: part.path, contents: nil) }
             refreshReceived()
 
-            // 轮流试下载源：一个源连不上、出错、或慢到不像话，就换下一个，从已经下到的地方接着下
-            var tries = 0
+            // 轮流试下载源：一个源连不上、出错、或慢到不像话，就换下一个，从已经下到的地方接着下；
+            // 三个仓库源都试过再挂直链兜底。
             var order = ModelSource.allCases
             if let i = order.firstIndex(of: source) { order = Array(order[i...] + order[..<i]) }
+            let candidates = order.map { $0.url(f) } + f.fallbackURLs
+            var tries = 0
             var ok = false
-            while !ok, !Task.isCancelled, tries < 9 {
-                let src = order[tries % order.count]
-                source = src
+            while !ok, !Task.isCancelled, tries < candidates.count {
+                let url = candidates[tries]
+                if tries < order.count { source = order[tries] }
                 tries += 1
-                let result = await fetch(f, from: src, to: part)
+                let result = await fetch(f, at: url, to: part)
                 switch result {
                 case .done: ok = true
                 case .cancelled: return
                 case .slow, .failed: continue
                 }
             }
-            guard ok else { fail(String(localized: "三个下载源都没下下来，检查网络后点「继续」再试。")); return }
+            guard ok else { fail(String(localized: "所有下载源都没下下来，检查网络后点「继续」再试。")); return }
 
             // 校验
             state = .verifying
@@ -141,11 +146,11 @@ final class DownloadJob {
 
     private enum FetchResult { case done, slow, failed, cancelled }
 
-    /// 从一个源接着下一个文件。前 20 秒平均不到 300 KB/s，或者 15 秒一个字节都没来，就算慢，换源。
-    private func fetch(_ f: ModelFile, from src: ModelSource, to part: URL) async -> FetchResult {
+    /// 从一个 URL 接着下一个文件。前 20 秒平均不到 300 KB/s，或者 15 秒一个字节都没来，就算慢，换源。
+    private func fetch(_ f: ModelFile, at url: URL, to part: URL) async -> FetchResult {
         let start = Self.fileSize(part)
         if start >= f.size { return .done }
-        let fetcher = RangeFetcher(url: src.url(f), offset: start, file: part)
+        let fetcher = RangeFetcher(url: url, offset: start, file: part)
         self.fetcher = fetcher
         defer { self.fetcher = nil }
 

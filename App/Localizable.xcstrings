@@ -1,6 +1,566 @@
 {
   "sourceLanguage": "zh-Hans",
   "strings": {
+    "不是": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not them"
+          }
+        }
+      }
+    },
+    "从左边选一位，或去录音里认人": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pick someone on the left, or identify people from a recording"
+          }
+        }
+      }
+    },
+    "从录音里认出的人会出现在这里，也可以先手动添加。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "People recognized from recordings show up here. You can also add them manually."
+          }
+        }
+      }
+    },
+    "从这里听": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Play from here"
+          }
+        }
+      }
+    },
+    "代表原声": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sample Clips"
+          }
+        }
+      }
+    },
+    "以后不提示": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Don't show again"
+          }
+        }
+      }
+    },
+    "保存": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Save"
+          }
+        }
+      }
+    },
+    "修改这条": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Edit"
+          }
+        }
+      }
+    },
+    "停": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stop"
+          }
+        }
+      }
+    },
+    "关联已有联系人": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Link to an existing contact"
+          }
+        }
+      }
+    },
+    "出现在 %@ · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Heard on %@ · %@"
+          }
+        }
+      }
+    },
+    "删除「我的声音」": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete “My Voice”"
+          }
+        }
+      }
+    },
+    "删除人物": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete Person"
+          }
+        }
+      }
+    },
+    "删除样本": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete Sample"
+          }
+        }
+      }
+    },
+    "升格为待认识人物": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Promote to unidentified person"
+          }
+        }
+      }
+    },
+    "去文字稿": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Transcript"
+          }
+        }
+      }
+    },
+    "去文字稿看这句": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open this line in the transcript"
+          }
+        }
+      }
+    },
+    "合并到这张卡…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Merge into this card…"
+          }
+        }
+      }
+    },
+    "听": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Play"
+          }
+        }
+      }
+    },
+    "听一听": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Listen"
+          }
+        }
+      }
+    },
+    "声纹模型没分出说话人，先按整段转写。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The speaker model found no separate speakers; transcribing as a whole."
+          }
+        }
+      }
+    },
+    "声音样本": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Voice Samples"
+          }
+        }
+      }
+    },
+    "姓名": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Name"
+          }
+        }
+      }
+    },
+    "导入声音样本": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Import Voice Sample"
+          }
+        }
+      }
+    },
+    "就地试听": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Play here"
+          }
+        }
+      }
+    },
+    "就是 TA": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That's them"
+          }
+        }
+      }
+    },
+    "已导入 %lld 段样本": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Imported %lld samples"
+          }
+        }
+      }
+    },
+    "待认识的声音（%lld）": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Voices to identify (%lld)"
+          }
+        }
+      }
+    },
+    "我的声音": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "My Voice"
+          }
+        }
+      }
+    },
+    "把另一张卡并进来：样本、发言与资料都归到这张卡，原卡删除，可撤销。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Merge another card into this one: samples, lines and notes move here and the other card is removed. You can undo."
+          }
+        }
+      }
+    },
+    "排除出「人物」": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exclude from People"
+          }
+        }
+      }
+    },
+    "搜姓名或备注": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Search names or notes"
+          }
+        }
+      }
+    },
+    "撤销上次合并": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Undo Last Merge"
+          }
+        }
+      }
+    },
+    "改归人物": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reassign to Person"
+          }
+        }
+      }
+    },
+    "无逐句时间戳，无法逐句归人。下面是按声音切出来的说话人，点开听是谁在说。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No per-line timestamps, so lines can't be attributed to speakers. These speakers were separated by sound — tap to hear who is talking."
+          }
+        }
+      }
+    },
+    "有一段声音疑似 TA（相似度 %lld%）": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A voice sounds like them (%lld%% similar)"
+          }
+        }
+      }
+    },
+    "未记名 %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unnamed %@"
+          }
+        }
+      }
+    },
+    "来自录音「%@」%@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "From “%@” %@"
+          }
+        }
+      }
+    },
+    "标为我": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mark as Me"
+          }
+        }
+      }
+    },
+    "没有其它可合并的联系人。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "There are no other contacts to merge."
+          }
+        }
+      }
+    },
+    "添加联系人": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add Contact"
+          }
+        }
+      }
+    },
+    "点开核对还没记名字的声音": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open to check voices that haven't been named"
+          }
+        }
+      }
+    },
+    "移除这条": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove"
+          }
+        }
+      }
+    },
+    "管理「我」的声音样本。在文字稿里把某句标成「我」时会用到": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Manage your own voice samples. Used when you mark a line as “Me” in the transcript"
+          }
+        }
+      }
+    },
+    "管理声音样本": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Manage Voice Samples"
+          }
+        }
+      }
+    },
+    "记下名字": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Save Name"
+          }
+        }
+      }
+    },
+    "试听这段": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Play this clip"
+          }
+        }
+      }
+    },
+    "说话人 %lld · %@ – %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Speaker %lld · %@ – %@"
+          }
+        }
+      }
+    },
+    "请确认是不是 TA": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Is this them?"
+          }
+        }
+      }
+    },
+    "返回 %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back to %@"
+          }
+        }
+      }
+    },
+    "还没有归属于 TA 的对话。去录音的文字稿里，把某句标给 TA。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No lines are assigned to this person yet. Open a transcript and assign a line to them."
+          }
+        }
+      }
+    },
+    "还没有样本。从录音里认出来的会自动留一段；也可以导入一段只含 TA 说话的音频。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No samples yet. A clip is kept automatically when a voice is recognized; you can also import audio of just this person speaking."
+          }
+        }
+      }
+    },
+    "还没有联系人": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No contacts yet"
+          }
+        }
+      }
+    },
+    "这个声音还没记名字。可以先听几段代表原声再决定。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This voice hasn't been named. Listen to a few sample clips first."
+          }
+        }
+      }
+    },
+    "这条没有可用的本地音频，分不出说话人。": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No local audio for this recording, so speakers can't be separated."
+          }
+        }
+      }
+    },
+    "选择一位": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose one"
+          }
+        }
+      }
+    },
     "": {
       "shouldTranslate": false
     },
@@ -15973,7 +16533,17 @@
           }
         }
       }
+    },
+  "返回人物（⌘⌥[）": {
+    "localizations": {
+      "en": {
+        "stringUnit": {
+          "state": "translated",
+          "value": "Back to person (⌘⌥[)"
+        }
+      }
     }
+  }
   },
   "version": "1.0"
 }

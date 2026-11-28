@@ -18,7 +18,10 @@ import Network
 
 // MARK: - 数据
 
-let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("BeanPod")
+// 指定了 BEANPOD_DATA_DIR（比如 App 用 -data-dir 隔离出来的测试库）就读写那一份；没指定读正式库
+let root = ProcessInfo.processInfo.environment["BEANPOD_DATA_DIR"]
+    .map { URL(fileURLWithPath: $0, isDirectory: true) }
+    ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("BeanPod", isDirectory: true)
 let libraryURL = root.appendingPathComponent("Recordings/library.json")
 let inboxURL = root.appendingPathComponent("Inbox", isDirectory: true)
 

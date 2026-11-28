@@ -9,6 +9,9 @@ options:
 packages:
   BeanKit:
     path: .
+  sherpa-onnx:
+    url: https://github.com/k2-fsa/sherpa-onnx
+    exactVersion: 2.0.3
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -25,6 +28,8 @@ targets:
     sources: [App, Shared]
     dependencies:
       - package: BeanKit
+      - package: sherpa-onnx
+        product: sherpa-onnx
       - target: beanpod-cli
         link: false
         embed: false
@@ -75,6 +80,41 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: NO
         SKIP_INSTALL: YES
+  speaker-lab:
+    type: tool
+    platform: macOS
+    sources:
+      - App/SpeakerEngine.swift
+      # SpeakerEngine 分窗后靠它跨窗重连说话人
+      - Shared/SpeakerMatching.swift
+      - tools/speaker-lab
+    dependencies:
+      - package: sherpa-onnx
+        product: sherpa-onnx
+    settings:
+      base:
+        PRODUCT_NAME: speaker-lab
+        SWIFT_VERSION: "6.0"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: NO
+        SKIP_INSTALL: YES
+  PeopleDBTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Shared/People.swift
+      - Shared/PeopleDB.swift
+      - Shared/SpeakerMatching.swift
+      - Shared/SpeakerRules.swift
+      - Tests/PeopleDBTests
+    settings:
+      base:
+        PRODUCT_NAME: PeopleDBTests
+        SWIFT_VERSION: "6.0"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        GENERATE_INFOPLIST_FILE: YES
   BeanPodMobile:
     type: application
     platform: iOS

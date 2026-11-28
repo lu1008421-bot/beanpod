@@ -20,6 +20,9 @@ extension BeanStore {
     func refreshASRAvailability() {
         asrAvailable = QwenASR.locateServer(custom: settings.llamaServerPath) != nil && QwenASR.locateModel() != nil
         localLLMReady = QwenASR.locateServer(custom: settings.llamaServerPath) != nil && LocalLLM.modelURL != nil
+        #if os(macOS)
+        speakerModelsReady = SpeakerEngine.hasSegmentationModel() && SpeakerEngine.hasEmbeddingModel()
+        #endif
     }
 
     /// 云端（或用户自己填的任何服务）的配置。
@@ -189,14 +192,40 @@ extension BeanStore {
 
     private func index(_ id: UInt32) -> Int? { recordings.firstIndex { $0.id == id } }
 
+    /// 文字稿里出现过几位说话人（没分过人就是 0）。
+    nonisolated static func localSpeakerCount(_ segments: [Segment]) -> Int {
+        Set(segments.compactMap(\.speaker)).count
+    }
+
+    /// 跑完一条录音后统一收尾：场景已定，新声音该建卡的建卡，再把人物身份投影回录音库。
+    /// 放在这里而不是各分支里，是为了整理失败、场景拦截建卡这些提前返回的情况也不会漏掉投影。
     private func run(_ id: UInt32) async {
+        await runBody(id)
+        guard recordings.contains(where: { $0.id == id }) else { return }
+        #if os(macOS)
+        finalizeStrangerCards(id)
+        syncPeopleToLibrary([id])
+        // 人物摘要排在润色之后、同一个串行队列里跑：模型还开着，不会被队列收尾时的 stop 打断
+        let attributed = (try? peopleDB?.listUtterances(recordingID: id))?.contains { $0.personID != nil } ?? false
+        if attributed, localLLMReady, LocalLLM.modelURL != nil {
+            await runPeopleInsights(id)
+        }
+        #else
+        syncPeopleToLibrary([id])
+        #endif
+    }
+
+    private func runBody(_ id: UInt32) async {
         guard let rec = recordings.first(where: { $0.id == id }) else { return }
+        // 这次进来前就已经有文字稿、也不是来重转写的：属于「升级前转写好的存量录音」
+        let alreadyTranscribed = !(rec.transcript ?? "").isEmpty && !retranscribing.contains(id)
 
         // 1. 转写
         if (rec.transcript ?? "").isEmpty || retranscribing.contains(id) {
             stages[id] = .transcribing(0)
             do {
                 let segments: [Segment], engine: String
+                var bySpeaker = false      // 这次转写是不是已经按说话人切的（路径 A）
                 refreshASRAvailability()
                 let preferred: ASRPreferredEngine = switch settings.engine {
                 case .qwen: .qwen
@@ -222,12 +251,32 @@ extension BeanStore {
                     }
                     engine = "云端 · \(asr.model)"
                 case .qwen:
+                    #if os(macOS)
+                    // 路径 A：声纹链路就绪、且这条录音该自动认人时，先分人再按说话人边界切块转写
+                    if rec.eligibleForAutoSpeaker, speakerPipelineReady {
+                        segments = try await transcribeWithSpeakers(id) { fraction in
+                            Task { @MainActor [weak self] in
+                                if case .transcribing = self?.stages[id] { self?.stages[id] = .transcribing(fraction) }
+                            }
+                        }
+                        engine = QwenASR.displayName + " · 声纹分人"
+                        bySpeaker = true
+                    } else {
+                        segments = try await QwenASR.shared.transcribe(wavURL(id), serverPath: settings.llamaServerPath) { fraction in
+                            Task { @MainActor [weak self] in
+                                if case .transcribing = self?.stages[id] { self?.stages[id] = .transcribing(fraction) }
+                            }
+                        }
+                        engine = QwenASR.displayName
+                    }
+                    #else
                     segments = try await QwenASR.shared.transcribe(wavURL(id), serverPath: settings.llamaServerPath) { fraction in
                         Task { @MainActor [weak self] in
                             if case .transcribing = self?.stages[id] { self?.stages[id] = .transcribing(fraction) }
                         }
                     }
                     engine = QwenASR.displayName
+                    #endif
                 case .apple:
                     let text = try await Transcriber.transcribe(wavURL(id), language: settings.language)
                     segments = text.isEmpty ? [] : [Segment(start: 0, text: text)]
@@ -248,9 +297,15 @@ extension BeanStore {
                     return
                 }
                 guard let i = index(id) else { return }
-                recordings[i].segments = segments.map { Segment(start: $0.start, text: applyVocabulary($0.text)) }
+                var fresh = segments.map { Segment(start: $0.start, text: applyVocabulary($0.text), speaker: $0.speaker, end: $0.end) }
+                #if os(macOS)
+                // 路径 B：文字稿不是按说话人切的（云端转写、系统识别），本地有 WAV 就分人后按时间对齐
+                if !bySpeaker { await alignTranscriptWithSpeakers(id, segments: &fresh) }
+                #endif
+                recordings[i].segments = fresh
                 recordings[i].transcript = recordings[i].segments.map(\.text).joined(separator: "\n")
                 recordings[i].transcribedBy = engine
+                syncLocalSpeakers(id, from: fresh)
                 saveLibrary()
             } catch {
                 let kept = !(rec.transcript ?? "").isEmpty
@@ -260,6 +315,16 @@ extension BeanStore {
                 return
             }
         }
+
+        #if os(macOS)
+        // 升级前转写好的存量录音没走过声纹：本地有 WAV、这次该认人、人物库里还没有它的发言记录，补一次分人对齐
+        if alreadyTranscribed, !rec.segments.isEmpty, speakerPathApplies(rec),
+           ((try? peopleDB?.listUtterances(recordingID: id)) ?? []).isEmpty {
+            stages[id] = .transcribing(0)
+            await backfillSpeakers(id)
+            stages[id] = nil
+        }
+        #endif
 
         // 2. 整理
         guard let i = index(id), let spoken = recordings[i].transcript else { return }
@@ -301,10 +366,12 @@ extension BeanStore {
                 }
             } catch {
                 problem = Problem(title: String(localized: "「\(rec.displayTitle)」没出完整纪要"), detail: String(localized: "分析模型这次没接通，先按关键词粗略分了类。\n原因：\(error.localizedDescription)\n检查一下设置里的分析模型，然后在这条录音上点「重新整理纪要」。"), action: .settings)
-                result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed)
+                result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed,
+                                         localSpeakers: Self.localSpeakerCount(recordings[i].segments))
             }
         } else {
-            result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed)
+            result = Analyzer.fallback(transcript: spoken, duration: rec.duration, fixedScene: fixed,
+                                     localSpeakers: Self.localSpeakerCount(recordings[i].segments))
         }
         guard let j = index(id) else { return }
         // 已经有模型出的纪要，这次模型没接通只能按关键词粗分：别用粗分把好的纪要、待办盖掉
@@ -1307,6 +1374,17 @@ extension BeanStore {
         job.start()
     }
 
+    #if os(macOS)
+    /// 下载（或接着下载）声纹模型：说话人分割 + 中英声纹向量（CAM++）。
+    func downloadSpeakerModels() {
+        if let job = speakerJob { job.start(); return }
+        let job = DownloadJob(files: SpeakerModels.defaults, folder: SpeakerEngine.modelFolder)
+        job.onFinish = { [weak self] ok in self?.speakerJob = nil; self?.refreshASRAvailability(); if ok { self?.addLog("声纹模型下载好了") } }
+        speakerJob = job
+        job.start()
+    }
+    #endif
+
     /// 上次没下完的（模型文件夹里有 .part），打开设置时显示成「已暂停」，点继续就接着下。
     func restorePausedDownloads() {
         func paused(_ files: [ModelFile], _ folder: URL) -> DownloadJob? {
@@ -1323,6 +1401,12 @@ extension BeanStore {
             j.onFinish = { [weak self] _ in self?.llmJob = nil; self?.refreshASRAvailability() }
             llmJob = j
         }
+        #if os(macOS)
+        if speakerJob == nil, let j = paused(SpeakerModels.defaults, SpeakerEngine.modelFolder) {
+            j.onFinish = { [weak self] _ in self?.speakerJob = nil; self?.refreshASRAvailability() }
+            speakerJob = j
+        }
+        #endif
     }
 
     #if os(macOS)

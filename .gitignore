@@ -10,3 +10,9 @@ design/ip/model/
 build-ios/
 build-release/
 dist/
+
+# 人物模块：声纹模型、SQLite 库、去标识测试音频都不入库
+*.onnx
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
